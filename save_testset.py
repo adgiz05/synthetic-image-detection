@@ -1,0 +1,200 @@
+import os
+import sys
+repo_path = os.path.abspath("training_utils") 
+sys.path.insert(0, repo_path)
+
+from PIL import Image
+import torch
+from torch.utils.data import DataLoader
+from torchvision import transforms
+from tqdm import tqdm
+import random
+import numpy as np
+
+import os
+import torch
+from PIL import Image, ImageFile
+from torch.utils.data import Dataset
+import albumentations as A
+import numpy as np
+import random
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+Image.MAX_IMAGE_PIXELS = 933120000
+
+    
+class ImagiNet(Dataset):
+    def __init__(self, root_dir, annotations_file, track="all", load_pil=False, get_only_sd=False, train=True, resize=False, default_aug_album=None, anchor=False,  test_aug=False, transform=None):
+        self.root_dir = root_dir
+        self.transform = transform
+        self.train = train
+        self.anchor = anchor
+        self.resize = resize
+        self.test_aug = test_aug
+        self.load_pil = load_pil
+        with open(annotations_file) as f:
+            lines = f.readlines()
+        tracks = ["origin", "content_type", "model", "specific_model", "all"]
+        if track not in tracks:
+            raise Exception("Not valid track")
+        ann = [{'image': line.strip().split(",")[0], 'label': line.strip().split(",")[1:]} for line in lines]
+        if track == tracks[0]:
+            self.annotations = [{'image': a["image"], 'label': a["label"][0]} for a in ann]
+        elif track == tracks[1]:
+            self.annotations = [{'image': a["image"], 'label': a["label"][1]} for a in ann if int(a["label"][0]) == 1]
+        elif track == tracks[2]:
+            self.annotations = [{'image': a["image"], 'label': a["label"][2]} for a in ann if int(a["label"][0]) == 1]
+        elif track == tracks[3]:
+            self.annotations = [{'image': a["image"], 'label': a["label"][3]} for a in ann if int(a["label"][0]) == 1]
+        else:
+            self.annotations = [{'image': a["image"], 'label': a["label"]} for a in ann]
+        
+        self.albu_transform = A.Compose([
+            A.PadIfNeeded(96, 96),
+            A.RandomCrop(96, 96),
+            A.OneOf([
+                A.OneOf([
+                    A.ImageCompression(quality_lower=50, quality_upper=95, compression_type=A.ImageCompression.ImageCompressionType.JPEG, p=1),
+                    A.ImageCompression(quality_lower=50, quality_upper=95, compression_type=A.ImageCompression.ImageCompressionType.WEBP, p=1),
+                ], p=1),
+                A.GaussianBlur(blur_limit=(3, 7), p=1.0),
+                A.GaussNoise(var_limit=(3.0, 10.0), p=1.0),
+            ], p=0.5),
+            A.RandomRotate90(p=0.33),
+            A.Flip(p=0.33),
+        ], p=1.0)
+        default_transform = [A.PadIfNeeded(256, 256), A.CenterCrop(256, 256)]
+        self.albu_default = A.Compose(default_transform, p=1) if default_aug_album is None else default_aug_album
+        self.label_transform = lambda data: torch.tensor(data, dtype=torch.long)
+
+    def __len__(self):
+        return len(self.annotations)
+
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.root_dir, self.annotations[idx]['image'])
+        image_o = Image.open(img_path).convert('RGB')
+        label = self.annotations[idx]['label']
+        image = None
+        if self.transform:
+            if self.load_pil:
+                image = self.transform(image_o)
+            else:
+                image_o =  np.asarray(image_o)
+                if self.train == True:
+                    if self.resize:
+                        h = random.randint(160, max(min(image_o.shape[0:2]), 160))
+                        interp = 4 if h > 256 else 2
+                        resize =  A.Compose([
+                                A.PadIfNeeded(h, h),
+                                A.RandomCrop(h,h),
+                                A.Resize(256, 256, interpolation=interp)], p=0.5)
+                        image_o = resize(image=image_o)["image"]
+                    image = self.albu_transform(image=image_o)["image"]
+                    image = self.transform(image)
+                else:
+                    if self.anchor:
+                        h = random.randint(160, max(min(image_o.shape[0:2]), 160))
+                        interp = 4 if h > 256 else 2
+                        res = A.Compose([
+                                    A.PadIfNeeded(256, 256),
+                                    A.RandomCrop(256, 256),
+                                    A.OneOf([
+                                        A.OneOf([
+                                            A.ImageCompression(quality_lower=50, quality_upper=95, compression_type=A.ImageCompression.ImageCompressionType.JPEG, p=1),
+                                            A.ImageCompression(quality_lower=50, quality_upper=95, compression_type=A.ImageCompression.ImageCompressionType.WEBP, p=1),
+                                        ], p=1),
+                                        A.GaussianBlur(blur_limit=(3, 7), p=1.0),
+                                        A.GaussNoise(var_limit=(3.0, 10.0), p=1.0)
+                                    ], p=1)
+                                ], p=0.5)
+                        if self.resize:
+                            res = A.OneOf([
+                                A.Compose([
+                                    A.PadIfNeeded(256, 256),
+                                    A.RandomResizedCrop(256, 256),
+                                    A.OneOf([
+                                        A.ImageCompression(quality_lower=50, quality_upper=95, compression_type=A.ImageCompression.ImageCompressionType.JPEG, p=1),
+                                        A.ImageCompression(quality_lower=50, quality_upper=95, compression_type=A.ImageCompression.ImageCompressionType.WEBP, p=1),
+                                    ], p=0.5),
+                                ], p=0.3),
+                                A.Compose([
+                                    A.PadIfNeeded(256, 256),
+                                    A.RandomCrop(256, 256),
+                                    A.OneOf([
+                                        A.OneOf([
+                                            A.ImageCompression(quality_lower=50, quality_upper=95, compression_type=A.ImageCompression.ImageCompressionType.JPEG, p=1),
+                                            A.ImageCompression(quality_lower=50, quality_upper=95, compression_type=A.ImageCompression.ImageCompressionType.WEBP, p=1),
+                                        ], p=1),
+                                        A.GaussianBlur(blur_limit=(3, 7), p=1.0),
+                                        A.GaussNoise(var_limit=(3.0, 10.0), p=1.0)
+                                    ], p=0.7)
+                                ], p=1)], p=0.5)
+                        anchor = A.Compose([
+                        res,
+                        A.PadIfNeeded(256, 256),
+                        A.RandomCrop(256, 256),
+                        A.RandomRotate90(p=0.33),
+                        A.Flip(p=0.33),
+                        ], p=1.0)
+                        image = anchor(image=image_o)["image"]
+                    else:
+
+                        if self.test_aug:
+                            h = random.randint(256, max(min(min(image_o.shape[0:2]), 1000), 256))
+                            interp = 4
+                            resize =  A.Compose([
+                                    A.PadIfNeeded(h, h),
+                                    A.RandomCrop(h,h),
+                                    A.Resize(256, 256, interpolation=interp),
+                                    A.OneOf([
+                                            A.ImageCompression(quality_lower=60, quality_upper=100, compression_type=A.ImageCompression.ImageCompressionType.JPEG, p=1),
+                                            A.ImageCompression(quality_lower=60, quality_upper=100, compression_type=A.ImageCompression.ImageCompressionType.WEBP, p=1),
+                                    ], p=0.75),
+                                    ], p=1)
+                            image = resize(image=image_o)["image"]
+                        else:
+                            image = self.albu_default(image=image_o)["image"]
+                    image = self.transform(image)
+        return image, self.label_transform(list(map(int, label)))
+
+random.seed(42)
+torch.cuda.manual_seed(42)
+torch.manual_seed(42)
+np.random.seed(42)
+models = ["gan", "sd", "midjourney", "dalle3"]
+categories = ["photos", "paintings", "faces", "uncategorized"]
+writers = [open("./test_gan.txt", "w"), open("./test_sd.txt", "w"), open("./test_midjourney.txt", "w"), open("./test_dalle3.txt", "w")]
+def save_images_from_dataloader(dataloader, output_directory, model, k):
+    for images_tensor, labels_tensor in tqdm(dataloader):
+        label_value = labels_tensor
+        images_numpy = images_tensor.numpy()
+        for i in range(images_numpy.shape[0]):
+            image_data = images_numpy[i].transpose((1, 2, 0))
+            pil_image = Image.fromarray((image_data * 255).astype('uint8'))
+            label_info = "real" if label_value[i, 0].item() == 0 else "synthetic"
+            category_info = categories[label_value[i, 1].item()]
+            main_folder = f"./testset/{category_info}/{label_info}"
+            w_idx = label_value[i, 2]
+            if label_value[i,0].item() != 0:
+                model_info = models[label_value[i, 2].item()]
+                main_folder += f"/{model_info}"
+            else:
+                w_idx = model
+            if not os.path.isdir(os.path.join(output_directory, main_folder)):
+                os.makedirs(os.path.join(output_directory, main_folder))
+            image_filename = f'{main_folder}/{str(k).rjust(5, "0")}.webp'
+            writers[w_idx].write(f"{image_filename},{label_value[i, 0].item()},{label_value[i, 1].item()},{label_value[i, 2].item()},{label_value[i, 3].item()}\n")
+            writers[w_idx].flush()
+            pil_image.save(os.path.join(output_directory, image_filename), 'WEBP', lossless=True)
+            k += 1
+    return k
+
+files = ["__deprecated__/annotations/test_annotations_gan.txt", "__deprecated__/annotations/test_annotations_sd.txt", "__deprecated__/annotations/test_annotations_midjourney.txt", "__deprecated__/annotations/test_annotations_dalle3.txt"]
+
+output_folder = "./data/" # REPLACE WITH FOLDER WHERE YOU WANT TO SAVE YOUR TESTSET
+os.mkdir(os.path.join(output_folder, "testset"))
+k_t = 0
+for i, a in enumerate(files):
+    dataset = ImagiNet('data/images', f"{a}", train=False, test_aug=True, transform=transforms.ToTensor())
+    dataloader = DataLoader(dataset, batch_size=20, num_workers=8, shuffle=False) # DO NOT CHANGE THE BATCH SIZE AND THE WORKERS (IT WON'T BE REPRODUCIBLE)
+    k_t = save_images_from_dataloader(dataloader, output_folder, i, k_t)
