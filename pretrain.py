@@ -6,8 +6,13 @@ import os
 
 import pytorch_lightning as pl
 import argparse
+from dataclasses import asdict
+from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
 
 os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+
+RESULTS_DIR = 'results/pretraining'
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Pretraining')
@@ -16,8 +21,8 @@ def parse_args():
     parser.add_argument('--n_views', type=int, default=1, help='Views per image')
     parser.add_argument('--randaug', action='store_true', help='Use RandAugment')
 
-    parser.add_argument('--batch_size', type=int, default=200, help='Batch size')
-    parser.add_argument('--num_workers', type=int, default=4, help='Number of workers for data loading')
+    parser.add_argument('--batch_size', type=int, default=100, help='Batch size')
+    parser.add_argument('--num_workers', type=int, default=16, help='Number of workers for data loading')
 
     parser.add_argument('--optimizer', type=str, default='sgd', help='Optimizer (sgd, adam, adamw)')
     parser.add_argument('--lr', type=float, default=5e-3, help='Learning rate')
@@ -36,8 +41,8 @@ def parse_args():
     parser.add_argument('--max_epochs', type=int, default=400, help='Number of epochs')
     parser.add_argument('--precision', type=str, default='bf16-mixed', help='Precision (32, 16, bf16-mixed)')
     parser.add_argument('--device', type=int, default=0, help='GPU to train in')
-    parser.add_argument('--check_val_every_n_epochs', type=int, default=5, help='Check val every n epochs')
-    parser.add_argument('--accumulate_grad_batches', type=int, default=1, help='Accumulate grad batches')
+    parser.add_argument('--check_val_every_n_epoch', type=int, default=10, help='Check val every n epochs')
+    parser.add_argument('--accumulate_grad_batches', type=int, default=2, help='Accumulate grad batches')
 
     args = parser.parse_args()
 
@@ -57,9 +62,53 @@ def parse_args():
         max_epochs=args.max_epochs,
         precision=args.precision,
         device=args.device,
-        default_root_dir='results/pretraining',
-        check_val_every_n_epochs=args.check_val_every_n_epochs,
+        default_root_dir=RESULTS_DIR,
+        check_val_every_n_epoch=args.check_val_every_n_epoch,
         accumulate_grad_batches=args.accumulate_grad_batches,
     )
 
 def setup_pretraining(config):
+    datamodule = SelfContrastivePretrainingDataModule(**asdict(config.datamodule_config))
+    module = SelfContrastivePretrainingModule(**asdict(config.module_config), config=asdict(config))
+
+    logger = WandbLogger(
+        name=config.logger_config.experiment_name,
+        project=config.logger_config.project,
+    )
+
+    callbacks = []
+
+    callbacks.append(ModelCheckpoint(
+        monitor=config.callbacks_config.checkpoint_monitor,
+        mode=config.callbacks_config.checkpoint_mode,
+        save_top_k=config.callbacks_config.checkpoint_save_top_k,
+    ))
+
+    callbacks.append(EarlyStopping(
+        monitor=config.callbacks_config.early_stopping_monitor,
+        mode=config.callbacks_config.early_stopping_mode,
+        patience=config.callbacks_config.early_stopping_patience,
+    ))
+
+    if config.callbacks_config.learning_rate_monitor:
+        callbacks.append(LearningRateMonitor(logging_interval='epoch'))
+    
+    trainer = pl.Trainer(
+        max_epochs=config.max_epochs,
+        precision=config.precision,
+        accelerator='gpu',
+        devices=[config.device],
+        default_root_dir=config.default_root_dir,
+        logger=logger,
+        callbacks=callbacks,
+        check_val_every_n_epoch=config.check_val_every_n_epoch,
+        accumulate_grad_batches=config.accumulate_grad_batches,
+    )
+
+    return datamodule, module, trainer
+
+if __name__ == '__main__':
+    config = parse_args()
+    datamodule, module, trainer = setup_pretraining(config)
+    trainer.fit(module, datamodule=datamodule)
+

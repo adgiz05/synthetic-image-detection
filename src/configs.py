@@ -58,5 +58,5 @@ class PretrainingConfig:
     precision                   : str = 'bf16-mixed'
     device                      : int = 0
     default_root_dir            : str = 'results/pretraining'
-    check_val_every_n_epochs    : int = 5
+    check_val_every_n_epoch     : int = 5
     accumulate_grad_batches     : int = 1

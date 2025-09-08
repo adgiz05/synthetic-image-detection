@@ -3,6 +3,7 @@ __deprecated__
 notebooks
 results
 notes.md
+wandb
 
 
 # Byte-compiled / optimized / DLL files

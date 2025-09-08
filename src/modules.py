@@ -8,8 +8,9 @@ import torch
 import pytorch_lightning as pl
 
 class SelfContrastivePretrainingModule(pl.LightningModule):
-    def __init__(self, model='conresnet', pretraining=True, optimizer_config={}, scheduler_config={}):
+    def __init__(self, model='conresnet', pretraining=True, optimizer_config={}, scheduler_config={}, config=None):
         super(SelfContrastivePretrainingModule, self).__init__()
+        self.save_hyperparameters()
         match model:
             case 'conresnet':
                 self.model = ConResNet(**CONRESNET_DEFAULT_CONFIG)

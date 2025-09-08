@@ -1,4 +1,5 @@
 import albumentations as A
+import cv2
 
 class PatchAugmentation:
     def __init__(self, size=96):
@@ -18,10 +19,10 @@ class PatchAugmentation:
 
             # Random resize
             A.OneOf([
-                A.Resize(self.size, self.size, interpolation=0),  # Nearest
-                A.Resize(self.size, self.size, interpolation=1),  # Linear
-                A.Resize(self.size, self.size, interpolation=2),  # Cubic
-                A.Resize(self.size, self.size, interpolation=3),  # Area
+                A.Resize(self.size, self.size, interpolation=cv2.INTER_NEAREST),
+                A.Resize(self.size, self.size, interpolation=cv2.INTER_LINEAR),
+                A.Resize(self.size, self.size, interpolation=cv2.INTER_CUBIC),
+                A.Resize(self.size, self.size, interpolation=cv2.INTER_AREA),
             ], p=0.5),
 
             # Compression + Noise (simula compresión con pérdida en redes sociales)
