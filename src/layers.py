@@ -410,3 +410,64 @@ class LinearClassifier(nn.Module):
 
     def forward(self, features):
         return self.fc(features)
+
+class ConResNet(nn.Module):
+    """backbone + projection head"""
+    def __init__(self, name='resnet50', head='mlp', feat_dim=128, selfcon_pos=[False,False,False], selfcon_arch='resnet', selfcon_size='same', dataset=''):
+        super(ConResNet, self).__init__()
+        model_fun, dim_in = model_dict[name]
+        """All this 'selfcon' stuff is other form of deep supervision.
+        For avoiding vanishing gradients in early layers of the network we add
+        auxiliary heads to the intermediate blocks for having not only the
+        final loss but also losses in the middle of the network.
+        It is basically architecturish regularization."""
+        self.encoder = model_fun(selfcon_pos=selfcon_pos, selfcon_arch=selfcon_arch, selfcon_size=selfcon_size, dataset=dataset)
+        if head == 'linear':
+            self.head = nn.Linear(dim_in, feat_dim)
+            
+            self.sub_heads = []
+            for pos in selfcon_pos:
+                if pos:
+                    self.sub_heads.append(nn.Linear(dim_in, feat_dim))
+        elif head == 'mlp':
+            self.head = nn.Sequential(
+                nn.Linear(dim_in, dim_in),
+                nn.ReLU(inplace=True),
+                nn.Linear(dim_in, feat_dim)
+            )
+            
+            heads = []
+            for pos in selfcon_pos:
+                if pos:
+                    heads.append(nn.Sequential(
+                        nn.Linear(dim_in, dim_in),
+                        nn.ReLU(inplace=True),
+                        nn.Linear(dim_in, feat_dim)
+                    ))
+            self.sub_heads = nn.ModuleList(heads)
+        else:
+            raise NotImplementedError(
+                'head not supported: {}'.format(head))
+
+    def forward(self, x):
+        sub_feat, feat = self.encoder(x)
+        
+        sh_feat = []
+        for sf, sub_head in zip(sub_feat, self.sub_heads):
+            # Project each "selfcon" head
+            sh_feat.append(F.normalize(sub_head(sf), dim=1))
+        
+        feat = F.normalize(self.head(feat), dim=1)
+        return sh_feat, feat
+    
+CONRESNET_DEFAULT_CONFIG = {
+    'name': 'resnet50nodown', 
+    'dataset': 'imaginet',
+    'selfcon_pos': [False, True, False],
+    'selfcon_arch': 'resnet',
+    'selfcon_size': 'same'
+}
+
+STR2MODEL = {
+    'conresnet': ConResNet(**CONRESNET_DEFAULT_CONFIG)
+}

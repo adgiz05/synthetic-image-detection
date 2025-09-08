@@ -1,17 +1,17 @@
-from augmentations import default_augmentation
-from transformations import default_imaginet_transform
+from .utils import NViewsTransform
+from .augmentations import PatchAugmentation
 
 import torch
 import numpy as np
 import pandas as pd
 from PIL import Image, ImageFile
+from torchvision import transforms as T
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = 933120000
 
-class ImagiNet(torch.utils.data.Dataset):
-    def __init__(self, split='train', task='all', transform=None, augmentation=None):
-        self.split = split
+class SelfContrastivePretrainingDataset(torch.utils.data.Dataset):
+    def __init__(self, split='train', task='all', augmentation='patched', size=96, n_views=1, randaug=False):
         self.data = pd.read_csv(f'data/{split}.csv')
 
         # Define label with respect to the task
@@ -23,10 +23,18 @@ class ImagiNet(torch.utils.data.Dataset):
             raise ValueError(f"Unknown task: {task}")
         
         # Augmentations
-        self.augmentation = augmentation if augmentation is not None else default_augmentation()
+        match augmentation:
+            case 'patched':
+                self.augmentation = PatchAugmentation(size=size)
+            case _:
+                self.augmentation = lambda x: x # No augmentation
 
-        # Transformations
-        self.transform = transform if transform is not None else default_imaginet_transform()
+        # Transformation      
+        self.transform = NViewsTransform(
+            pre_transform=self.augmentation,
+            n_views=n_views,
+            randaug=randaug
+        )
 
     def __len__(self):
         return len(self.data)
@@ -37,9 +45,7 @@ class ImagiNet(torch.utils.data.Dataset):
         # IMAGE LOADING
         image = np.asarray(Image.open(row['image_path']).convert('RGB')) # Load as a numpy array
 
-        if self.split in ['train', 'val']: # Training/Validation set
-            image = self.augmentation(image=image)['image']
-
+        # IMAGE TRANSFORMATION
         image = self.transform(image)
 
         # LABEL FORMAT

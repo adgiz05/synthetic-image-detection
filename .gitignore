@@ -1,4 +1,9 @@
 data
+__deprecated__
+notebooks
+results
+notes.md
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

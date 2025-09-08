@@ -119,36 +119,10 @@ class MultiLabelLossImagiNet(nn.Module):
         self.weight_2 = weight_2
         self.weight_3 = weight_3
         self.loss_1 = ConLoss(temp_1, base_temperature=temp_base_1)
-        self.loss_2 = ConLoss(temp_2, base_temperature=temp_base_2)
+        self.loss_2 = ConLoss(temp_2, base_temperature=temp_base_2) # This loss is not used
         self.loss_3 = ConLoss(temp_3, base_temperature=temp_base_3)
     def forward(self, features, labels):
         labels_1 = labels[:, 0]
         labels_3 = labels[labels[:, 0] == 1, 2]
         features_3 = features[labels[:, 0] == 1]
         return self.weight_1*self.loss_1(features, labels_1) + self.weight_3*self.loss_3(features_3, labels_3)
-    
-class MultiLabelLoss(nn.Module):
-    def __init__(self, temp_1=0.07, temp_base_1=0.07, temp_2=0.07, temp_base_2=0.07, weight_1=1, weight_2=1):
-        super(MultiLabelLoss, self).__init__()
-        self.weight_1 = weight_1
-        self.weight_2 = weight_2
-        self.loss_1 = ConLoss(temp_1, base_temperature=temp_base_1)
-        self.loss_2 = ConLoss(temp_2, base_temperature=temp_base_2)
-        self.loss_2 = ConLoss(temp_2, base_temperature=temp_base_2)
-    def forward(self, features, labels):
-        labels_1 = labels[:, 0]
-        labels_2 = labels[:, 1]
-        return self.weight_1*self.loss_1(features, labels_1) + self.weight_2*self.loss_2(features, labels_2)
-    
-class KLLoss(nn.Module):
-    """Distilling the Knowledge in a Neural Network"""
-    def __init__(self, T=3.0):
-        super(KLLoss, self).__init__()
-        self.T = T
-
-    def forward(self, logit_s, logit_t):
-        p_s = F.log_softmax(logit_s/self.T, dim=1)
-        p_t = F.softmax(logit_t.clone().detach()/self.T, dim=1)
-        loss = -pow(self.T, 2)*(p_s * p_t).sum(dim=1).mean()
-        
-        return loss
