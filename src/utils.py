@@ -2,20 +2,19 @@ from PIL import Image as PILImage
 import torchvision.transforms as T
 from torchvision.models import resnet50, ResNet50_Weights
 
-IMAGINET_MEAN = (0.485, 0.456, 0.406)
-IMAGINET_STD = (0.229, 0.224, 0.225)
-IMAGINET_SIZE = 256
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
 
 class NViewsTransform:
     """Create N views of the same image"""
-    def __init__(self, pre_transform=None, n_views=1, randaug=False):
+    def __init__(self, pre_transform=None, n_views=1, randaug=False, normalize=True, rescale=True):
         self.pre_transform = pre_transform
         self.n_views = n_views
     
         self.transform = T.Compose([
             *([T.RandAugment(num_ops=2, magnitude=9)] if randaug else []),
             T.ToTensor(),
-            T.Normalize(mean=IMAGINET_MEAN, std=IMAGINET_STD)
+            *([T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)] if normalize else []),
         ])
 
     def _view(self, image):

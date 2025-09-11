@@ -471,3 +471,25 @@ CONRESNET_DEFAULT_CONFIG = {
 STR2MODEL = {
     'conresnet': ConResNet(**CONRESNET_DEFAULT_CONFIG)
 }
+
+class CLSHead(torch.nn.Module):
+    def __init__(self, in_features, out_features, _type='linear', p_drop=0.1):
+        super(CLSHead, self).__init__()
+
+        self.head = torch.nn.Identity()
+        match _type:
+            case 'linear':
+                self.head = torch.nn.Linear(in_features, out_features)
+            case 'mlp':
+                self.head = torch.nn.Sequential(
+                    torch.nn.BatchNorm1d(in_features),
+                    torch.nn.Linear(in_features, in_features//2),
+                    torch.nn.ReLU(),
+                    torch.nn.Dropout(p_drop),
+                    torch.nn.Linear(in_features//2, out_features)
+                )
+            case _:
+                raise NotImplementedError(f'Head type {_type} not implemented')
+
+    def forward(self, x):
+        return self.head(x)

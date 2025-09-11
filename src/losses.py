@@ -126,3 +126,34 @@ class MultiLabelLossImagiNet(nn.Module):
         labels_3 = labels[labels[:, 0] == 1, 2]
         features_3 = features[labels[:, 0] == 1]
         return self.weight_1*self.loss_1(features, labels_1) + self.weight_3*self.loss_3(features_3, labels_3)
+
+GENERATOR_LABEL_IDX = 2
+SPECIFIC_MODEL_LABEL_IDX = 3
+
+class DualSyntheticLoss(nn.Module):
+    def __init__(self, synthetic_weight=1., model_weight=1., model_loss='generator'):
+        super(DualSyntheticLoss, self).__init__()
+        self.synthetic_weight = synthetic_weight
+        self.model_weight = model_weight
+        self.synthetic_loss = nn.CrossEntropyLoss() # Synthetic vs Real
+        self.model_loss = nn.CrossEntropyLoss() # Model classification
+
+        match model_loss:
+            case 'generator':
+                self.model_loss_idx = GENERATOR_LABEL_IDX
+            case 'specific_model':
+                self.model_loss_idx = SPECIFIC_MODEL_LABEL_IDX
+            case _:
+                raise ValueError(f"Unknown model_loss: {model_loss}")
+
+    def forward(self, logits_1, logits_2, labels):
+        # Synthetic vs Real
+        labels_1 = labels[:, 0]
+        synthetic_loss = self.synthetic_weight*self.synthetic_loss(logits_1, labels_1)
+
+        # Model classification
+        labels_2 = labels[labels[:, 0] == 1, self.model_loss_idx]
+        logits_2 = logits_2[labels[:, 0] == 1]  # (only for synthetic samples)
+        model_loss = self.model_weight*self.model_loss(logits_2, labels_2)
+
+        return synthetic_loss, model_loss
