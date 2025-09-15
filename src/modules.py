@@ -6,14 +6,14 @@ from src.utils import load_resnet50_imagenet_weights
 
 import torch
 import pytorch_lightning as pl
-
-import torch
-import pytorch_lightning as pl
 from transformers import AutoModel
+from torchmetrics import Accuracy, F1Score, AUROC, MetricCollection
 from src.losses import DualSyntheticLoss
 
 NUM_GENERATORS = 4
 NUM_SPECIFIC_MODELS = 8
+GENERATOR_LABEL_IDX = 2
+SPECIFIC_MODEL_LABEL_IDX = 3
 
 class ImageModule(pl.LightningModule):
     def __init__(self, model_id='google/vit-base-patch16-224-in21k', optimizer_config={}, scheduler_config={}, loss_config={}, config=None):
@@ -29,6 +29,19 @@ class ImageModule(pl.LightningModule):
         # Classification Heads
         self.synthetic_head = CLSHead(self.model.config.hidden_size, 2, _type='mlp')
         self.model_head = CLSHead(self.model.config.hidden_size, NUM_GENERATORS, _type='mlp')
+
+        metrics = MetricCollection({
+            'synth_acc' : Accuracy(task='binary', num_classes=2),
+            'synth_f1' : F1Score(task='binary', num_classes=2, average='macro'),
+            'synth_auroc' : AUROC(task='binary', num_classes=2),
+            'model_acc' : Accuracy(task='multiclass', num_classes=NUM_GENERATORS),
+            'model_f1' : F1Score(task='multiclass', num_classes=NUM_GENERATORS, average='macro'),
+            'model_auroc' : AUROC(task='multiclass', num_classes=NUM_GENERATORS),
+        })
+
+        self.train_metrics = metrics.clone(prefix='train/')
+        self.val_metrics = metrics.clone(prefix='val/')
+        self.test_metrics = metrics.clone(prefix='test/')
 
     def forward(self, images, labels, return_features=False):
         """
@@ -54,27 +67,81 @@ class ImageModule(pl.LightningModule):
         images, labels = batch
 
         out = self(images, labels)
+
+        self.train_metrics.update(
+            {
+                "synth_acc": (out["synthetic_logits"], labels[:, 0]),
+                "synth_f1": (out["synthetic_logits"], labels[:, 0]),
+                "synth_auroc": (out["synthetic_logits"], labels[:, 0]),
+                "model_acc": (out["model_logits"], labels[labels[:, 1] == 1, GENERATOR_LABEL_IDX]),
+                "model_f1": (out["model_logits"], labels[labels[:, 1] == 1, GENERATOR_LABEL_IDX]),
+                "model_auroc": (out["model_logits"], labels[labels[:, 1] == 1, GENERATOR_LABEL_IDX]),
+            }
+        )
         self.log_dict({
             'train/synthetic_loss' : out['synthetic_loss'],
             'train/model_loss' : out['model_loss'],
             'train/loss' : out['loss']
-        }, prog_bar=True)
+        }, on_step=True, on_epoch=True)
+
         return out['loss']
     
     def validation_step(self, batch, batch_idx):
         images, labels = batch
         out = self(images, labels)
+        self.val_metrics.update(
+            {
+                "synth_acc": (out["synthetic_logits"], labels[:, 0]),
+                "synth_f1": (out["synthetic_logits"], labels[:, 0]),
+                "synth_auroc": (out["synthetic_logits"], labels[:, 0]),
+                "model_acc": (out["model_logits"], labels[labels[:, 1] == 1, GENERATOR_LABEL_IDX]),
+                "model_f1": (out["model_logits"], labels[labels[:, 1] == 1, GENERATOR_LABEL_IDX]),
+                "model_auroc": (out["model_logits"], labels[labels[:, 1] == 1, GENERATOR_LABEL_IDX]),
+            }
+        )
         self.log_dict({
             'val/synthetic_loss' : out['synthetic_loss'],
             'val/model_loss' : out['model_loss'],
             'val/loss' : out['loss']
-        }, prog_bar=True)
+        }, on_step=False, on_epoch=True)
+        return out['loss']
+    
+    def test_step(self, batch, batch_idx):
+        images, labels = batch
+        out = self(images, labels)
+        self.test_metrics.update(
+            {
+                "synth_acc": (out["synthetic_logits"], labels[:, 0]),
+                "synth_f1": (out["synthetic_logits"], labels[:, 0]),
+                "synth_auroc": (out["synthetic_logits"], labels[:, 0]),
+                "model_acc": (out["model_logits"], labels[labels[:, 1] == 1, GENERATOR_LABEL_IDX]),
+                "model_f1": (out["model_logits"], labels[labels[:, 1] == 1, GENERATOR_LABEL_IDX]),
+                "model_auroc": (out["model_logits"], labels[labels[:, 1] == 1, GENERATOR_LABEL_IDX]),
+            }
+        )
+        self.log_dict({
+            'test/synthetic_loss' : out['synthetic_loss'],
+            'test/model_loss' : out['model_loss'],
+            'test/loss' : out['loss']
+        }, on_step=False, on_epoch=True)
         return out['loss']
 
     def configure_optimizers(self):
         optimizer = OptimizerFactory(**self.optimizer_config)(self.parameters())
         scheduler = SchedulerFactory(**self.scheduler_config)(optimizer)
         return [optimizer], [scheduler]
+    
+    def on_train_epoch_end(self):
+        self.log_dict(self.train_metrics.compute(), prog_bar=True)
+        self.train_metrics.reset()
+
+    def on_validation_epoch_end(self):
+        self.log_dict(self.val_metrics.compute(), prog_bar=True)
+        self.val_metrics.reset()
+
+    def on_test_epoch_end(self):
+        self.log_dict(self.test_metrics.compute(), prog_bar=True)
+        self.test_metrics.reset()    
 
 class SelfContrastivePretrainingModule(pl.LightningModule):
     def __init__(self, model='conresnet', pretraining=True, optimizer_config={}, scheduler_config={}, config=None):
