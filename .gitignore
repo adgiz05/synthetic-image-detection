@@ -6,7 +6,8 @@ notes.md
 wandb
 imaginet-pretraining
 imaginet-cls
-
+imaginet-noise
+wandb
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 # Synthetic CLS
 @dataclass
 class AugmentationConfig:
+    transformations: bool = True
     downscaling_prob: float = 0.3
     resize_prob: float = 0.3
     compression_prob: float = 0.3
@@ -19,6 +20,7 @@ class ImageDatasetConfig:
     size                : int = 224
     augmentation        : str = 'patched'
     augmentation_config : AugmentationConfig = field(default_factory=AugmentationConfig)
+    dataset_size        : str = 'full'  # 'full' or 'reduced'
 
 @dataclass
 class ImageDataModuleConfig:

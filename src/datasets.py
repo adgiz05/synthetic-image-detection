@@ -7,6 +7,10 @@ import numpy as np
 import pandas as pd
 from PIL import Image, ImageFile
 from torchvision import transforms as T
+import os
+from pathlib import Path
+
+import random
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = 933120000
@@ -19,9 +23,11 @@ class ImageDataset(torch.utils.data.Dataset):
                  size: int = 224, # Size of the image or patch
                  augmentation_config: dict = {}, # Additional config for augmentation
                  return_residual: bool = False, # Whether to return the residual (original - augmented)
-                 return_original: bool = False # Whether to return the original image
+                 return_original: bool = False, # Whether to return the original image
+                 dataset_size: str = 'full' # 'full' or 'reduced' dataset size
                  ):
-        self.data = pd.read_csv(f'data/{split}.csv')
+        # Load data
+        self.data = pd.read_csv(f'data/{split}.csv') if dataset_size == 'full' else pd.read_csv(f'data/reduced_splits/{split}.csv')
 
         # Define label with respect to the task
         if task == 'all':
@@ -31,6 +37,7 @@ class ImageDataset(torch.utils.data.Dataset):
         else:
             raise ValueError(f"Unknown task: {task}")
         
+        self.size = size
         # Augmentations
         match augmentation:
             case 'patched':
@@ -46,20 +53,23 @@ class ImageDataset(torch.utils.data.Dataset):
     
     def __getitem__(self, idx):
         row = self.data.iloc[idx]
-        
-        # IMAGE LOADING
-        original = np.asarray(Image.open(row['image_path']).convert('RGB')) # Load as a numpy array
+        path = row['image_path']
 
-        # IMAGE AUGMENTATION
-        image = self.augmentation(original)
+        try:
+            original = np.asarray(Image.open(path).convert('RGB'))
+            image = self.augmentation(original) # IMAGE AUGMENTATION
+        except:
+            print(f"[WARN] Could not load image {path}") 
+            original = np.zeros((self.size, self.size, 3), dtype=np.uint8) # Dummy black image (size x size x 3)
+            image = original
 
         # LABEL FORMAT
         label = [row[t] for t in self.task]
 
         return {
-            **({'original' : original} if self.return_original else {}),
-            'image' : image,
-            'label' : label
+            **({'original': original} if self.return_original else {}),
+            'image': image,
+            'label': label
         }
 
 class SelfContrastivePretrainingDataset(torch.utils.data.Dataset):
@@ -104,3 +114,67 @@ class SelfContrastivePretrainingDataset(torch.utils.data.Dataset):
         label = torch.tensor([row[t] for t in self.task], dtype=torch.long)
 
         return image, label
+
+class NoiseDataset(torch.utils.data.Dataset):
+    def __init__(self, split='train', patch_size=128, transform=None):
+        self.data = pd.read_csv(f"data/{split}.csv")
+        self.patch_size = patch_size
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        img_path = self.data.iloc[idx]["image_path"]
+        label = self.data.iloc[idx]["label"]
+
+        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            raise FileNotFoundError(f"Could not load image {img_path}")
+
+        # random crop
+        h_img, w_img = img.shape
+        ph = self.patch_size
+        if h_img < ph or w_img < ph:
+            img = cv2.resize(img, (max(w_img, ph), max(h_img, ph)))
+            h_img, w_img = img.shape
+
+        y = random.randint(0, h_img - ph)
+        x = random.randint(0, w_img - ph)
+        patch = img[y:y+ph, x:x+ph]
+
+        # normalize [0,1]
+        patch = patch.astype(np.float32) / 255.0
+        patch_tensor = torch.from_numpy(patch).unsqueeze(0)  # (1, H, W)
+
+        if self.transform:
+            patch_tensor = self.transform(patch_tensor)
+
+        return patch_tensor, torch.tensor(label, dtype=torch.long)
+
+class NoiseDatasetPT(torch.utils.data.Dataset):
+    def __init__(self, split='train', cache_dir='data/noise/images', patch_size=128):
+        """
+        Dataset de tensores cacheados (.pt), siempre en escala de grises.
+        Si la imagen >= patch_size: crop.
+        Si la imagen < patch_size en alguna dimensión: pad hasta patch_size.
+        """
+        self.cache_dir = Path(cache_dir) / split
+        self.data = pd.read_csv(f"data/noise/{split}.csv")
+        self.split = split
+        self.patch_size = patch_size
+
+        self.to_float = T.ConvertImageDtype(torch.float32)
+        self.to_gray = T.Grayscale(num_output_channels=1)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        row = self.data.iloc[idx]
+        tensor = torch.load(self.cache_dir / (Path(row.image_path).stem + ".pt"))  # [C,H,W], uint8
+
+        tensor = self.to_float(tensor)  # [C,H,W] en float32 [0,1]
+        tensor = self.to_gray(tensor)   # [1,H,W]
+
+        return tensor, int(row.label)

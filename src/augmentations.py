@@ -1,4 +1,5 @@
 import cv2
+import numpy as np
 import albumentations as A
 
 class PatchAugmentation:
@@ -28,6 +29,9 @@ class PatchAugmentation:
         self.flip_prob = flip_prob
 
     def __call__(self, image):
+        if image.dtype != np.uint8: # Force albumentations works with uint8
+            image = np.clip(image, 0, 255).astype(np.uint8)
+
         transforms = [
             *([
                 # Downscaling (simulate low-res upload)

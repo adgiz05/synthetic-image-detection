@@ -8,6 +8,7 @@ import pytorch_lightning as pl
 import argparse
 from dataclasses import asdict
 from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.profilers import AdvancedProfiler, SimpleProfiler
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
 
 os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
@@ -20,6 +21,9 @@ def parse_args():
     parser.add_argument('--size', type=int, default=224, help='Image size')
     parser.add_argument('--augmentation', type=str, default='patched', help='Augmentation (patched, none)')
 
+    parser.add_argument('--dataset_size', type=str, default='full', help='Dataset size (full, reduced)')
+
+    parser.add_argument('--no_transformations', action='store_false', dest='transformations', help='Whether to apply transformations')    
     parser.add_argument('--downscaling_prob', type=float, default=0.3, help='Downscaling probability')
     parser.add_argument('--resize_prob', type=float, default=0.3, help='Resize probability')
     parser.add_argument('--compression_prob', type=float, default=0.3, help='Compression probability')
@@ -30,7 +34,7 @@ def parse_args():
     parser.add_argument('--rotation_prob', type=float, default=0.1, help='Rotation probability')
     parser.add_argument('--flip_prob', type=float, default=0.1, help='Flip probability')
 
-    parser.add_argument('--batch_size', type=int, default=100, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=256, help='Batch size')
     parser.add_argument('--num_workers', type=int, default=16, help='Number of workers for data loading')
 
     parser.add_argument('--optimizer', type=str, default='adamw', help='Optimizer (sgd, adam, adamw)')
@@ -54,12 +58,13 @@ def parse_args():
     parser.add_argument('--max_epochs', type=int, default=400, help='Number of epochs')
     parser.add_argument('--precision', type=str, default='bf16-mixed', help='Precision (32, 16, bf16-mixed)')
     parser.add_argument('--device', type=int, default=0, help='GPU to train in')
-    parser.add_argument('--check_val_every_n_epoch', type=int, default=10, help='Check val every n epochs')
+    parser.add_argument('--check_val_every_n_epoch', type=int, default=1, help='Check val every n epochs')
     parser.add_argument('--accumulate_grad_batches', type=int, default=2, help='Accumulate grad batches')
 
     args = parser.parse_args()
 
     augmentation_config = AugmentationConfig(
+        transformations=args.transformations,
         downscaling_prob=args.downscaling_prob,
         resize_prob=args.resize_prob,
         compression_prob=args.compression_prob,
@@ -70,7 +75,7 @@ def parse_args():
         rotation_prob=args.rotation_prob,
         flip_prob=args.flip_prob,
     )
-    dataset_config = ImageDatasetConfig(task=args.task, size=args.size, augmentation=args.augmentation, augmentation_config=augmentation_config)
+    dataset_config = ImageDatasetConfig(task=args.task, size=args.size, augmentation=args.augmentation, augmentation_config=augmentation_config, dataset_size=args.dataset_size)
     datamodule_config = ImageDataModuleConfig(batch_size=args.batch_size, num_workers=args.num_workers, train_dataset_config=dataset_config, val_dataset_config=dataset_config)
     optimizer_config = ImageOptimizerConfig(name=args.optimizer, lr=args.lr, weight_decay=args.weight_decay)
     scheduler_config = ImageSchedulerConfig(name=args.scheduler, max_epochs=args.max_epochs, scheduler_skip=args.scheduler_skip)
@@ -101,6 +106,8 @@ def setup_pretraining(config):
         project=config.logger_config.project,
     )
 
+    profiler = AdvancedProfiler()
+
     callbacks = []
 
     callbacks.append(ModelCheckpoint(
@@ -124,6 +131,7 @@ def setup_pretraining(config):
         accelerator='gpu',
         devices=[config.device],
         default_root_dir=config.default_root_dir,
+        profiler=profiler,
         logger=logger,
         callbacks=callbacks,
         check_val_every_n_epoch=config.check_val_every_n_epoch,
@@ -136,4 +144,7 @@ if __name__ == '__main__':
     config = parse_args()
     datamodule, module, trainer = setup_pretraining(config)
     trainer.fit(module, datamodule=datamodule)
+    # best_model_path = trainer.checkpoint_callback.best_model_path
+    # best_model = ImageModule.load_from_checkpoint(best_model_path, config=asdict(config))
+    # trainer.test(best_model, datamodule=datamodule)
 
