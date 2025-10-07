@@ -1,4 +1,4 @@
-from .utils import NViewsTransform
+from .utils import NViewsTransform, IMAGENET_MEAN, IMAGENET_STD
 from .augmentations import PatchAugmentation
 
 import cv2
@@ -27,7 +27,15 @@ class ImageDataset(torch.utils.data.Dataset):
                  dataset_size: str = 'full' # 'full' or 'reduced' dataset size
                  ):
         # Load data
-        self.data = pd.read_csv(f'data/{split}.csv') if dataset_size == 'full' else pd.read_csv(f'data/reduced_splits/{split}.csv')
+        match dataset_size:
+            case 'full':
+                self.data = pd.read_csv(f'data/{split}.csv')
+            case 'reduced':
+                self.data = pd.read_csv(f'data/reduced_splits/{split}.csv')
+            case 'filtered':
+                self.data = pd.read_csv(f'data/filtered_splits/{split}.csv')
+            case _:
+                raise ValueError(f"Unknown dataset_size: {dataset_size}")
 
         # Define label with respect to the task
         if task == 'all':
@@ -45,6 +53,11 @@ class ImageDataset(torch.utils.data.Dataset):
             case _:
                 self.augmentation = lambda x: x # No augmentation
 
+        self.to_tensor = T.Compose([
+            T.ToTensor(),  # HWC uint8 -> CHW float [0,1]
+            T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+        ])
+
         self.return_residual = return_residual # TODO: try adding the residual
         self.return_original = return_original 
 
@@ -56,21 +69,29 @@ class ImageDataset(torch.utils.data.Dataset):
         path = row['image_path']
 
         try:
-            original = np.asarray(Image.open(path).convert('RGB'))
-            image = self.augmentation(original) # IMAGE AUGMENTATION
+            original = np.asarray(Image.open(path).convert('RGB'))  # np.uint8 HxWxC
+            aug_img = self.augmentation(original)                   # aún np.uint8 HxWxC
         except:
-            print(f"[WARN] Could not load image {path}") 
-            original = np.zeros((self.size, self.size, 3), dtype=np.uint8) # Dummy black image (size x size x 3)
-            image = original
+            print(f"[WARN] Could not load image {path}")
+            original = np.zeros((self.size, self.size, 3), dtype=np.uint8)
+            aug_img = original
 
-        # LABEL FORMAT
+        # A tensor normalizado (CHW float), aquí ya en el worker
+        pil_img = Image.fromarray(aug_img)
+        image_tensor = self.to_tensor(pil_img)                      # torch.float32 [C,H,W]
+
+        # Etiquetas como lista (el collate las apila a tensor)
         label = [row[t] for t in self.task]
 
-        return {
-            **({'original': original} if self.return_original else {}),
-            'image': image,
+        out = {
+            'image': image_tensor,
             'label': label
         }
+
+        if self.return_original:
+            out['original'] = original
+
+        return out
 
 class SelfContrastivePretrainingDataset(torch.utils.data.Dataset):
     def __init__(self, split='train', task='all', augmentation='patched', size=96, n_views=1, randaug=False):

@@ -27,9 +27,10 @@ class ImageDataModule(pl.LightningDataModule):
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             pin_memory=True,
-            prefetch_factor=2,
+            # prefetch_factor=4,
             shuffle=True,
-            collate_fn=self.collate_fn
+            collate_fn=self.collate_fn,
+            persistent_workers=True,
         )
     
     def val_dataloader(self):
@@ -38,9 +39,10 @@ class ImageDataModule(pl.LightningDataModule):
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             pin_memory=True,
-            prefetch_factor=2,
+            # prefetch_factor=4,
             shuffle=False,
-            collate_fn=self.collate_fn
+            collate_fn=self.collate_fn,
+            persistent_workers=True,
         )
     
     def test_dataloader(self):
