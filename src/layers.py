@@ -493,3 +493,20 @@ class CLSHead(torch.nn.Module):
 
     def forward(self, x):
         return self.head(x)
+
+class AttnPool(nn.Module):
+    """Attention-based pooling (MIL)."""
+    def __init__(self, in_dim, hid=512):
+        super().__init__()
+        self.attn = nn.Sequential(
+            nn.Linear(in_dim, hid),
+            nn.Tanh(),
+            nn.Linear(hid, 1)
+        )
+    def forward(self, x, mask):
+        # x: [B,N,D], mask: [B,N]
+        scores = self.attn(x).squeeze(-1)              # [B,N]
+        scores = scores.masked_fill(~mask, -1e9)
+        w = torch.softmax(scores, dim=-1)              # [B,N]
+        pooled = (w.unsqueeze(-1) * x).sum(dim=1)      # [B,D]
+        return pooled, w                               

@@ -93,6 +93,38 @@ class ImageDataset(torch.utils.data.Dataset):
 
         return out
 
+class FullImageDataset(torch.utils.data.Dataset):
+    def __init__(self, split='train', task='all', size=224):
+        self.data = pd.read_csv(f'data/full_img_splits/{split}.csv')
+
+        if task == 'all':
+            self.task = ['label', 'content_type', 'model', 'specific_model']
+        elif task in ['label','content_type','model','specific_model']:
+            self.task = [task]
+        else:
+            raise ValueError(f"Unknown task: {task}")
+
+        # Solo normalización (sin recortar a size; el tiling lo hará el collator)
+        self.to_tensor = T.Compose([
+            T.ToTensor(),
+            T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+        ])
+
+    def __len__(self): return len(self.data)
+
+    def __getitem__(self, idx):
+        row = self.data.iloc[idx]
+        path = row['image_path']
+        try:
+            img = np.asarray(Image.open(path).convert('RGB'))
+        except:
+            h = w = 512
+            img = np.zeros((h, w, 3), dtype=np.uint8)
+        tensor = self.to_tensor(Image.fromarray(img))  # [C,H,W] float
+        label = [row[t] for t in self.task]
+        return {'image': tensor, 'label': label}
+
+
 class SelfContrastivePretrainingDataset(torch.utils.data.Dataset):
     def __init__(self, split='train', task='all', augmentation='patched', size=96, n_views=1, randaug=False):
         self.data = pd.read_csv(f'data/{split}.csv')

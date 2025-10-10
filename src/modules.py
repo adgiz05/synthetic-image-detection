@@ -1,5 +1,5 @@
 from src.losses import MultiLabelLossImagiNet
-from src.layers import ConResNet, CONRESNET_DEFAULT_CONFIG, CLSHead
+from src.layers import ConResNet, CONRESNET_DEFAULT_CONFIG, CLSHead, AttnPool
 from src.optimizers import OptimizerFactory
 from src.schedulers import SchedulerFactory
 from src.utils import load_resnet50_imagenet_weights
@@ -156,6 +156,143 @@ class ImageModule(pl.LightningModule):
         self.log_dict(self.model_metrics['test_split'].compute(), prog_bar=True)
         self.synthetic_metrics['test_split'].reset()
         self.model_metrics['test_split'].reset()  
+
+class FullImageModule(pl.LightningModule):
+    def __init__(self, backbone=None,
+                 optimizer_config={}, scheduler_config={}, loss_config={}, freeze_backbone=False,
+                 aggregator='attn', aggregator_dim=512):
+        super().__init__()
+        self.save_hyperparameters()
+        if backbone is None:
+            self.backbone = AutoModel.from_pretrained('google/vit-base-patch16-224-in21k')
+        else:
+            self.backbone = backbone
+
+        if freeze_backbone:
+            for p in self.backbone.parameters(): p.requires_grad = False
+
+        D = self.backbone.config.hidden_size
+        if aggregator == 'attn':
+            self.aggregator = AttnPool(D, aggregator_dim)
+            self.use_posenc = False
+        else:
+            raise ValueError(f"Not known aggregator: {aggregator}.")
+
+        self.synthetic_head = CLSHead(D, 2, _type='mlp')
+        self.model_head = CLSHead(D, NUM_GENERATORS, _type='mlp')
+        self.criterion = DualSyntheticLoss(**loss_config)
+
+        syn = MetricCollection({
+            "acc": Accuracy(task="multiclass", num_classes=2),
+            "f1": F1Score(task="multiclass", num_classes=2, average="macro"),
+            "auroc": AUROC(task="multiclass", num_classes=2),
+        })
+        self.synthetic_metrics = nn.ModuleDict({
+            'train_split': syn.clone(prefix="train/synthetic_"),
+            'val_split':   syn.clone(prefix="val/synthetic_"),
+            'test_split':  syn.clone(prefix="test/synthetic_"),
+        })
+        mod = MetricCollection({
+            "acc": Accuracy(task="multiclass", num_classes=NUM_GENERATORS),
+            "f1": F1Score(task="multiclass", num_classes=NUM_GENERATORS, average="macro"),
+            "auroc": AUROC(task="multiclass", num_classes=NUM_GENERATORS),
+        })
+        self.model_metrics = nn.ModuleDict({
+            'train_split': mod.clone(prefix="train/model_"),
+            'val_split':   mod.clone(prefix="val/model_"),
+            'test_split':  mod.clone(prefix="test/model_"),
+        })
+
+        self.optimizer_config = optimizer_config
+        self.scheduler_config = scheduler_config
+
+    def encode_patches(self, patches, mask):
+        # patches: [B,N,C,H,W] → [B,N,D]
+        B,N,C,H,W = patches.shape
+        flat = patches.view(B*N, C, H, W)
+        feats = self.backbone(pixel_values=flat).pooler_output  # [B*N,D]
+        feats = feats.view(B, N, -1)
+        return feats
+
+    def forward(self, batch, labels, return_attn=False):
+        (images, mask, coords) = batch
+        feats = self.encode_patches(images, mask)      # [B,N,D]
+        emb, attn_w = self.aggregator(feats, mask)     # [B,D], [B,N]
+        syn_logits = self.synthetic_head(emb)
+        mod_logits = self.model_head(emb)
+        syn_loss, mod_loss = self.criterion(syn_logits, mod_logits, labels)
+        out = {
+            'synthetic_logits': syn_logits,
+            'model_logits': mod_logits,
+            'synthetic_loss': syn_loss,
+            'model_loss': mod_loss,
+            'loss': syn_loss + mod_loss
+        }
+        if return_attn: out['attn'] = attn_w
+        return out
+
+    def _update_metrics(self, split, out, labels):
+        split = f'{split}_split'
+        synthetic_preds = out['synthetic_logits']
+        synthetic_labels = labels[:, 0]
+        self.synthetic_metrics[split].update(synthetic_preds, synthetic_labels)
+
+        smask = synthetic_labels == 1
+        if smask.any():
+            self.model_metrics[split].update(out['model_logits'][smask], labels[smask, GENERATOR_LABEL_IDX])
+
+    def training_step(self, batch, idx):
+        batch_x, labels = batch
+        out = self(batch_x, labels)
+        self._update_metrics('train', out, labels)
+        self.log_dict({
+            'train/synthetic_loss': out['synthetic_loss'],
+            'train/model_loss': out['model_loss'],
+            'train/loss': out['loss']
+        }, on_step=True, on_epoch=True)
+        return out['loss']
+
+    def validation_step(self, batch, idx):
+        batch_x, labels = batch
+        out = self(batch_x, labels)
+        self._update_metrics('val', out, labels)
+        self.log_dict({
+            'val/synthetic_loss': out['synthetic_loss'],
+            'val/model_loss': out['model_loss'],
+            'val/loss': out['loss']
+        }, on_step=False, on_epoch=True)
+        return out['loss']
+
+    def test_step(self, batch, idx):
+        batch_x, labels = batch
+        out = self(batch_x, labels)
+        self._update_metrics('test', out, labels)
+        self.log_dict({
+            'test/synthetic_loss': out['synthetic_loss'],
+            'test/model_loss': out['model_loss'],
+            'test/loss': out['loss']
+        }, on_step=False, on_epoch=True)
+        return out['loss']
+
+    def on_train_epoch_end(self):
+        self.log_dict(self.synthetic_metrics['train_split'].compute(), prog_bar=True)
+        self.log_dict(self.model_metrics['train_split'].compute(), prog_bar=True)
+        self.synthetic_metrics['train_split'].reset(); self.model_metrics['train_split'].reset()
+
+    def on_validation_epoch_end(self):
+        self.log_dict(self.synthetic_metrics['val_split'].compute(), prog_bar=True)
+        self.log_dict(self.model_metrics['val_split'].compute(), prog_bar=True)
+        self.synthetic_metrics['val_split'].reset(); self.model_metrics['val_split'].reset()
+
+    def on_test_epoch_end(self):
+        self.log_dict(self.synthetic_metrics['test_split'].compute(), prog_bar=True)
+        self.log_dict(self.model_metrics['test_split'].compute(), prog_bar=True)
+        self.synthetic_metrics['test_split'].reset(); self.model_metrics['test_split'].reset()
+
+    def configure_optimizers(self):
+        opt = OptimizerFactory(**self.optimizer_config)(self.parameters())
+        sch = SchedulerFactory(**self.scheduler_config)(opt)
+        return [opt], [sch]
 
 class SelfContrastivePretrainingModule(pl.LightningModule):
     def __init__(self, model='conresnet', pretraining=True, optimizer_config={}, scheduler_config={}, config=None):
