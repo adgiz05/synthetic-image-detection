@@ -68,19 +68,16 @@ def setup_finetuning(args):
         max_patches=args.max_patches
     )
 
-    # --- load backbone from patch-level checkpoint ---
-    patch_module = ImageModule.load_from_checkpoint(args.checkpoint_path, strict=False)
-    backbone = patch_module.model  # pretrained ViT
-
     # --- build the new aggregator model ---
     module = FullImageModule(
-        backbone=backbone,
+        backbone_path=args.checkpoint_path,
         optimizer_config={'name': args.optimizer, 'lr': args.lr, 'weight_decay': args.weight_decay},
         scheduler_config={'name': args.scheduler, 'max_epochs': args.max_epochs, 'scheduler_skip': args.scheduler_skip},
         loss_config={'synthetic_weight': args.synthetic_weight, 'model_weight': args.model_weight, 'model_loss': args.model_loss},
         freeze_backbone=args.freeze_backbone,
         aggregator="attn",
         aggregator_dim=512,
+        device=args.device
     )
 
     # --- wandb logger ---

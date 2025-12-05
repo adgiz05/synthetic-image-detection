@@ -4,22 +4,71 @@ import torch.nn.functional as F
 from src.datasets import *
 from src.collators import *
 
+# class ImageDataModule(pl.LightningDataModule):
+#     def __init__(self, batch_size=200, num_workers=4, train_dataset_config={}, val_dataset_config={}):
+#         super(ImageDataModule, self).__init__()
+#         self.batch_size = batch_size
+#         self.num_workers = num_workers
+
+#         self.train_dataset_config = train_dataset_config
+#         self.val_dataset_config = val_dataset_config
+
+#     def setup(self, stage=None):
+#         if stage == 'fit' or stage is None:
+#             self.train_dataset = ImageDataset(split='train', **self.train_dataset_config)
+#             self.val_dataset = ImageDataset(split='val', **self.val_dataset_config)
+#             # No augmentation for test just patching
+#             self.test_dataset = ImageDataset(split='test', size=self.train_dataset_config['size'], augmentation_config={'transformations': False}) 
+#         self.collate_fn = ImageCollator()
+
+#     def train_dataloader(self):
+#         return torch.utils.data.DataLoader(
+#             dataset=self.train_dataset,
+#             batch_size=self.batch_size,
+#             num_workers=self.num_workers,
+#             pin_memory=True,
+#             # prefetch_factor=4,
+#             shuffle=True,
+#             collate_fn=self.collate_fn,
+#             persistent_workers=True,
+#         )
+    
+#     def val_dataloader(self):
+#         return torch.utils.data.DataLoader(
+#             dataset=self.val_dataset,
+#             batch_size=self.batch_size,
+#             num_workers=self.num_workers,
+#             pin_memory=True,
+#             # prefetch_factor=4,
+#             shuffle=False,
+#             collate_fn=self.collate_fn,
+#             persistent_workers=True,
+#         )
+    
+#     def test_dataloader(self):
+#         return torch.utils.data.DataLoader(
+#             dataset=self.test_dataset,
+#             batch_size=self.batch_size,
+#             num_workers=self.num_workers,
+#             shuffle=False,
+#             collate_fn=self.collate_fn
+#         )
+
 class ImageDataModule(pl.LightningDataModule):
-    def __init__(self, batch_size=200, num_workers=4, train_dataset_config={}, val_dataset_config={}):
+    def __init__(self, train_path, val_path, batch_size=256, num_workers=4, patch_size=224):
         super(ImageDataModule, self).__init__()
         self.batch_size = batch_size
         self.num_workers = num_workers
-
-        self.train_dataset_config = train_dataset_config
-        self.val_dataset_config = val_dataset_config
+        self.train_path = train_path
+        self.val_path = val_path
+        self.patch_size = patch_size
 
     def setup(self, stage=None):
         if stage == 'fit' or stage is None:
-            self.train_dataset = ImageDataset(split='train', **self.train_dataset_config)
-            self.val_dataset = ImageDataset(split='val', **self.val_dataset_config)
-            # No augmentation for test just patching
-            self.test_dataset = ImageDataset(split='test', size=self.train_dataset_config['size'], augmentation_config={'transformations': False}) 
-        self.collate_fn = ImageCollator()
+            self.train_dataset = ImageDataset(data_path=self.train_path)
+            self.val_dataset = ImageDataset(data_path=self.val_path)
+
+        self.collate_fn = CRPatchedCollator(patch_size=self.patch_size)
 
     def train_dataloader(self):
         return torch.utils.data.DataLoader(
@@ -44,28 +93,21 @@ class ImageDataModule(pl.LightningDataModule):
             collate_fn=self.collate_fn,
             persistent_workers=True,
         )
-    
-    def test_dataloader(self):
-        return torch.utils.data.DataLoader(
-            dataset=self.test_dataset,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            shuffle=False,
-            collate_fn=self.collate_fn
-        )
 
 class FullImageDataModule(pl.LightningDataModule):
-    def __init__(self, batch_size=8, num_workers=8, dataset_config={}, patch_size=224, stride=None, max_patches=32):
+    def __init__(self, train_path, val_path, batch_size=8, num_workers=8, patch_size=224, stride=None, max_patches=32):
         super().__init__()
         self.batch_size = batch_size
         self.num_workers = num_workers
-        self.dataset_config = dataset_config
+        self.train_path = train_path
+        self.val_path = val_path
+        self.patch_size = patch_size
         self.collate_fn = FullImageCollator(patch_size=patch_size, stride=stride, max_patches=max_patches)
 
     def setup(self, stage=None):
         if stage in ('fit', None):
-            self.train_dataset = FullImageDataset(split='train', **self.dataset_config)
-            self.val_dataset   = FullImageDataset(split='val', **self.dataset_config)
+            self.train_dataset = ImageDataset(data_path=self.train_path)
+            self.val_dataset   = ImageDataset(data_path=self.val_path)
 
     def train_dataloader(self):
         return torch.utils.data.DataLoader(self.train_dataset, batch_size=self.batch_size,

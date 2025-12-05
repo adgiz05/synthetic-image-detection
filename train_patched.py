@@ -55,7 +55,7 @@ def parse_args():
 
     parser.add_argument('--early_stopping_patience', type=int, default=50, help='Early stopping patience')
 
-    parser.add_argument('--max_epochs', type=int, default=400, help='Number of epochs')
+    parser.add_argument('--max_epochs', type=int, default=200, help='Number of epochs')
     parser.add_argument('--precision', type=str, default='bf16-mixed', help='Precision (32, 16, bf16-mixed)')
     parser.add_argument('--device', type=int, default=0, help='GPU to train in')
     parser.add_argument('--check_val_every_n_epoch', type=int, default=5, help='Check val every n epochs')

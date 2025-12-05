@@ -50,7 +50,7 @@ class PatchAugmentation:
                 ], p=self.resize_prob),
 
                 # Compression artifacts (solo JPEG, más estable que WebP)
-                A.ImageCompression(quality_lower=40, quality_upper=95, compression_type=0,
+                A.ImageCompression(quality_lower=40, quality_upper=95, compression_type='jpeg',
                                    p=self.compression_prob),
 
                 # Blur or noise
@@ -75,8 +75,8 @@ class PatchAugmentation:
                     A.NoOp(p=1.0),
                 ], p=self.texture_prob),
 
-                # Local artifacts (solo Cutout, barato)
-                A.Cutout(num_holes=1, max_h_size=32, max_w_size=32,
+                # Local artifacts (solo CoarseDropout, barato)
+                A.CoarseDropout(num_holes=1, max_h_size=32, max_w_size=32,
                          fill_value=0, p=self.local_artifacts_prob),
 
                 # Geometric transformations

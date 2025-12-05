@@ -1,0 +1,194 @@
+train:
+- batch_idx: 0
+  image_idx: 0
+  original_file: null
+  patches_file: /home/adrian/synthetic-image-detection/out/assets/debug_viz/debug_viz_train/train_b0_i0_patches_t3.png
+  path: null
+  split: train
+  transform_code: 3
+  transformations:
+  - resize
+  - compression
+- batch_idx: 1
+  image_idx: 0
+  original_file: null
+  patches_file: /home/adrian/synthetic-image-detection/out/assets/debug_viz/debug_viz_train/train_b1_i0_patches_t3.png
+  path: null
+  split: train
+  transform_code: 3
+  transformations:
+  - resize
+  - compression
+- batch_idx: 2
+  image_idx: 0
+  original_file: null
+  patches_file: /home/adrian/synthetic-image-detection/out/assets/debug_viz/debug_viz_train/train_b2_i0_patches_t3.png
+  path: null
+  split: train
+  transform_code: 3
+  transformations:
+  - resize
+  - compression
+- batch_idx: 3
+  image_idx: 0
+  original_file: null
+  patches_file: /home/adrian/synthetic-image-detection/out/assets/debug_viz/debug_viz_train/train_b3_i0_patches_t3.png
+  path: null
+  split: train
+  transform_code: 3
+  transformations:
+  - resize
+  - compression
+- batch_idx: 4
+  image_idx: 0
+  original_file: null
+  patches_file: /home/adrian/synthetic-image-detection/out/assets/debug_viz/debug_viz_train/train_b4_i0_patches_t2.png
+  path: null
+  split: train
+  transform_code: 2
+  transformations:
+  - resize
+- batch_idx: 5
+  image_idx: 0
+  original_file: null
+  patches_file: /home/adrian/synthetic-image-detection/out/assets/debug_viz/debug_viz_train/train_b5_i0_patches_t0.png
+  path: null
+  split: train
+  transform_code: 0
+  transformations:
+  - none
+- batch_idx: 6
+  image_idx: 0
+  original_file: null
+  patches_file: /home/adrian/synthetic-image-detection/out/assets/debug_viz/debug_viz_train/train_b6_i0_patches_t3.png
+  path: null
+  split: train
+  transform_code: 3
+  transformations:
+  - resize
+  - compression
+- batch_idx: 7
+  image_idx: 0
+  original_file: null
+  patches_file: /home/adrian/synthetic-image-detection/out/assets/debug_viz/debug_viz_train/train_b7_i0_patches_t1.png
+  path: null
+  split: train
+  transform_code: 1
+  transformations:
+  - compression
+- batch_idx: 8
+  image_idx: 0
+  original_file: null
+  patches_file: /home/adrian/synthetic-image-detection/out/assets/debug_viz/debug_viz_train/train_b8_i0_patches_t2.png
+  path: null
+  split: train
+  transform_code: 2
+  transformations:
+  - resize
+- batch_idx: 9
+  image_idx: 0
+  original_file: null
+  patches_file: /home/adrian/synthetic-image-detection/out/assets/debug_viz/debug_viz_train/train_b9_i0_patches_t1.png
+  path: null
+  split: train
+  transform_code: 1
+  transformations:
+  - compression
+val:
+- batch_idx: 0
+  image_idx: 0
+  original_file: null
+  patches_file: /home/adrian/synthetic-image-detection/out/assets/debug_viz/debug_viz_val/val_b0_i0_patches_t3.png
+  path: null
+  split: val
+  transform_code: 3
+  transformations:
+  - resize
+  - compression
+- batch_idx: 1
+  image_idx: 0
+  original_file: null
+  patches_file: /home/adrian/synthetic-image-detection/out/assets/debug_viz/debug_viz_val/val_b1_i0_patches_t3.png
+  path: null
+  split: val
+  transform_code: 3
+  transformations:
+  - resize
+  - compression
+- batch_idx: 2
+  image_idx: 0
+  original_file: null
+  patches_file: /home/adrian/synthetic-image-detection/out/assets/debug_viz/debug_viz_val/val_b2_i0_patches_t3.png
+  path: null
+  split: val
+  transform_code: 3
+  transformations:
+  - resize
+  - compression
+- batch_idx: 3
+  image_idx: 0
+  original_file: null
+  patches_file: /home/adrian/synthetic-image-detection/out/assets/debug_viz/debug_viz_val/val_b3_i0_patches_t3.png
+  path: null
+  split: val
+  transform_code: 3
+  transformations:
+  - resize
+  - compression
+- batch_idx: 4
+  image_idx: 0
+  original_file: null
+  patches_file: /home/adrian/synthetic-image-detection/out/assets/debug_viz/debug_viz_val/val_b4_i0_patches_t2.png
+  path: null
+  split: val
+  transform_code: 2
+  transformations:
+  - resize
+- batch_idx: 5
+  image_idx: 0
+  original_file: null
+  patches_file: /home/adrian/synthetic-image-detection/out/assets/debug_viz/debug_viz_val/val_b5_i0_patches_t3.png
+  path: null
+  split: val
+  transform_code: 3
+  transformations:
+  - resize
+  - compression
+- batch_idx: 6
+  image_idx: 0
+  original_file: null
+  patches_file: /home/adrian/synthetic-image-detection/out/assets/debug_viz/debug_viz_val/val_b6_i0_patches_t1.png
+  path: null
+  split: val
+  transform_code: 1
+  transformations:
+  - compression
+- batch_idx: 7
+  image_idx: 0
+  original_file: null
+  patches_file: /home/adrian/synthetic-image-detection/out/assets/debug_viz/debug_viz_val/val_b7_i0_patches_t3.png
+  path: null
+  split: val
+  transform_code: 3
+  transformations:
+  - resize
+  - compression
+- batch_idx: 8
+  image_idx: 0
+  original_file: null
+  patches_file: /home/adrian/synthetic-image-detection/out/assets/debug_viz/debug_viz_val/val_b8_i0_patches_t2.png
+  path: null
+  split: val
+  transform_code: 2
+  transformations:
+  - resize
+- batch_idx: 9
+  image_idx: 0
+  original_file: null
+  patches_file: /home/adrian/synthetic-image-detection/out/assets/debug_viz/debug_viz_val/val_b9_i0_patches_t3.png
+  path: null
+  split: val
+  transform_code: 3
+  transformations:
+  - resize
+  - compression

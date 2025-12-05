@@ -15,51 +15,96 @@ import random
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = 933120000
 
-class ImageDataset(torch.utils.data.Dataset):
-    def __init__(self,
-                 split: str = 'train', # Dataset split (corresponding to a CSV file in data/)
-                 task: str = 'all', # Task to perform: 'all', 'label', 'content_type', 'model', 'specific_model'
-                 augmentation: str = 'patched', # Augmentation to apply: 'patched' or 'none'
-                 size: int = 224, # Size of the image or patch
-                 augmentation_config: dict = {}, # Additional config for augmentation
-                 return_residual: bool = False, # Whether to return the residual (original - augmented)
-                 return_original: bool = False, # Whether to return the original image
-                 dataset_size: str = 'full' # 'full' or 'reduced' dataset size
-                 ):
-        # Load data
-        match dataset_size:
-            case 'full':
-                self.data = pd.read_csv(f'data/{split}.csv')
-            case 'reduced':
-                self.data = pd.read_csv(f'data/reduced_splits/{split}.csv')
-            case 'filtered':
-                self.data = pd.read_csv(f'data/filtered_splits/{split}.csv')
-            case _:
-                raise ValueError(f"Unknown dataset_size: {dataset_size}")
+# class ImageDataset(torch.utils.data.Dataset):
+#     def __init__(self,
+#                  split: str = 'train', # Dataset split (corresponding to a CSV file in data/)
+#                  task: str = 'all', # Task to perform: 'all', 'label', 'content_type', 'model', 'specific_model'
+#                  augmentation: str = 'patched', # Augmentation to apply: 'patched' or 'none'
+#                  size: int = 224, # Size of the image or patch
+#                  augmentation_config: dict = {}, # Additional config for augmentation
+#                  return_residual: bool = False, # Whether to return the residual (original - augmented)
+#                  return_original: bool = False, # Whether to return the original image
+#                  dataset_size: str = 'full' # 'full' or 'reduced' dataset size
+#                  ):
+#         # Load data
+#         match dataset_size:
+#             case 'full':
+#                 self.data = pd.read_csv(f'data/{split}.csv')
+#             case 'reduced':
+#                 self.data = pd.read_csv(f'data/reduced_splits/{split}.csv')
+#             case 'filtered':
+#                 self.data = pd.read_csv(f'data/filtered_splits/{split}.csv')
+#             case _:
+#                 raise ValueError(f"Unknown dataset_size: {dataset_size}")
 
-        # Define label with respect to the task
+#         # Define label with respect to the task
+#         if task == 'all':
+#             self.task = ['label', 'content_type', 'model', 'specific_model']
+#         elif task in ['label', 'content_type', 'model', 'specific_model']:
+#             self.task = [task]
+#         else:
+#             raise ValueError(f"Unknown task: {task}")
+        
+#         self.size = size
+#         # Augmentations
+#         match augmentation:
+#             case 'patched':
+#                 self.augmentation = PatchAugmentation(size=size, **augmentation_config)
+#             case _:
+#                 self.augmentation = lambda x: x # No augmentation
+
+#         self.to_tensor = T.Compose([
+#             T.ToTensor(),  # HWC uint8 -> CHW float [0,1]
+#             T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+#         ])
+
+#         self.return_residual = return_residual # TODO: try adding the residual
+#         self.return_original = return_original 
+
+#     def __len__(self):
+#         return len(self.data)
+    
+#     def __getitem__(self, idx):
+#         row = self.data.iloc[idx]
+#         path = row['image_path']
+
+#         try:
+#             original = np.asarray(Image.open(path).convert('RGB'))  # np.uint8 HxWxC
+#             aug_img = self.augmentation(original)                   # aún np.uint8 HxWxC
+#         except:
+#             print(f"[WARN] Could not load image {path}")
+#             original = np.zeros((self.size, self.size, 3), dtype=np.uint8)
+#             aug_img = original
+
+#         # A tensor normalizado (CHW float), aquí ya en el worker
+#         pil_img = Image.fromarray(aug_img)
+#         image_tensor = self.to_tensor(pil_img)                      # torch.float32 [C,H,W]
+
+#         # Etiquetas como lista (el collate las apila a tensor)
+#         label = [row[t] for t in self.task]
+
+#         out = {
+#             'image': image_tensor,
+#             'label': label
+#         }
+
+#         if self.return_original:
+#             out['original'] = original
+
+#         return out
+
+class ImageDataset(torch.utils.data.Dataset):
+    def __init__(self, data_path, task='all', max_image_size=1440):
+        self.data = pd.read_csv(data_path)
+
         if task == 'all':
             self.task = ['label', 'content_type', 'model', 'specific_model']
         elif task in ['label', 'content_type', 'model', 'specific_model']:
             self.task = [task]
         else:
             raise ValueError(f"Unknown task: {task}")
-        
-        self.size = size
-        # Augmentations
-        match augmentation:
-            case 'patched':
-                self.augmentation = PatchAugmentation(size=size, **augmentation_config)
-            case _:
-                self.augmentation = lambda x: x # No augmentation
 
-        self.to_tensor = T.Compose([
-            T.ToTensor(),  # HWC uint8 -> CHW float [0,1]
-            T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
-        ])
-
-        self.return_residual = return_residual # TODO: try adding the residual
-        self.return_original = return_original 
+        self.max_image_size = max_image_size
 
     def __len__(self):
         return len(self.data)
@@ -69,33 +114,32 @@ class ImageDataset(torch.utils.data.Dataset):
         path = row['image_path']
 
         try:
-            original = np.asarray(Image.open(path).convert('RGB'))  # np.uint8 HxWxC
-            aug_img = self.augmentation(original)                   # aún np.uint8 HxWxC
+            img = Image.open(path).convert('RGB')
+            w, h = img.size
+            max_side = max(w, h)
+            if max_side > self.max_image_size:
+                scale = self.max_image_size / max_side
+                img = img.resize(
+                    (int(w * scale), int(h * scale)),
+                    Image.Resampling.LANCZOS
+                )
         except:
             print(f"[WARN] Could not load image {path}")
-            original = np.zeros((self.size, self.size, 3), dtype=np.uint8)
-            aug_img = original
+            img = Image.new("RGB", (512, 512), color=(0,0,0))
 
-        # A tensor normalizado (CHW float), aquí ya en el worker
-        pil_img = Image.fromarray(aug_img)
-        image_tensor = self.to_tensor(pil_img)                      # torch.float32 [C,H,W]
-
-        # Etiquetas como lista (el collate las apila a tensor)
+        # Labels: you decide how to output them
         label = [row[t] for t in self.task]
 
-        out = {
-            'image': image_tensor,
-            'label': label
-        }
-
-        if self.return_original:
-            out['original'] = original
-
-        return out
+        return {'image': img, 'label': label}
 
 class FullImageDataset(torch.utils.data.Dataset):
-    def __init__(self, split='train', task='all', size=224):
-        self.data = pd.read_csv(f'data/full_img_splits/{split}.csv')
+    def __init__(self, split='train', task='all', size=224, dataframe=None):
+        if split == 'test':
+            self.data = pd.read_csv(f'data/{split}.csv')
+        elif split == 'custom':
+            self.data = dataframe
+        else:
+            self.data = pd.read_csv(f'data/full_img_splits/{split}.csv')
 
         if task == 'all':
             self.task = ['label', 'content_type', 'model', 'specific_model']

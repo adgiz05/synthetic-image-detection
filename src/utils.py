@@ -4,6 +4,8 @@ from torchvision.models import resnet50, ResNet50_Weights
 import math
 import torch
 import torch.nn.functional as F
+import math
+import transformers
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -40,10 +42,6 @@ def load_resnet50_imagenet_weights(resnet):
     del st1, m_t
     resnet.encoder.load_state_dict(st)
     return resnet
-
-import math
-import torch
-import torch.nn.functional as F
 
 def sliding_window_indices(H, W, patch, stride):
     ys = list(range(0, max(H - patch, 0) + 1, stride)) or [0]
@@ -126,3 +124,234 @@ def positional_encoding_2d(coords, d_model):
         pe[:, 2*i* (d_model//4) : (2*i+1)*(d_model//4)] = torch.sin(ax.unsqueeze(1) * div_term)
         pe[:, (2*i+1)*(d_model//4) : (2*i+2)*(d_model//4)] = torch.cos(ax.unsqueeze(1) * div_term)
     return pe
+
+def register_vit_safe_globals():
+    vit = transformers.models.vit.modeling_vit
+    cfg = transformers.models.vit.configuration_vit
+    torch.serialization.add_safe_globals([
+        vit.ViTModel, vit.ViTEmbeddings, vit.ViTPatchEmbeddings,
+        vit.ViTEncoder, vit.ViTLayer, vit.ViTAttention,
+        vit.ViTSelfAttention, vit.ViTSelfOutput,
+        vit.ViTIntermediate, vit.ViTOutput, vit.ViTPooler,
+        cfg.ViTConfig,
+        transformers.activations.GELUActivation,
+        torch.nn.modules.dropout.Dropout,
+        torch.nn.modules.linear.Linear,
+        torch.nn.modules.conv.Conv2d,
+        torch.nn.modules.normalization.LayerNorm,
+        torch.nn.modules.container.ModuleList,
+        torch.nn.modules.activation.Tanh,
+        torch._C._nn.gelu,
+    ])
+
+# -------------------------------------------------------------------------
+# Debug visualization helpers
+# -------------------------------------------------------------------------
+
+def decode_transform_mask(mask_code: int):
+    """
+    Decode a transform mask into human-readable components.
+
+    Bits:
+        1 -> compression
+        2 -> resize
+    """
+    components = []
+    if mask_code & 2:
+        components.append("resize")
+    if mask_code & 1:
+        components.append("compression")
+    if mask_code == 0:
+        components.append("none")
+    return components
+
+def denormalize_image(t: torch.Tensor) -> torch.Tensor:
+    """
+    Denormalize a tensor image that was normalized with IMAGENET_MEAN/STD.
+    Expects tensor in [C,H,W].
+    """
+    mean = torch.tensor(IMAGENET_MEAN, dtype=t.dtype, device=t.device).view(3, 1, 1)
+    std = torch.tensor(IMAGENET_STD, dtype=t.dtype, device=t.device).view(3, 1, 1)
+    return t * std + mean
+
+
+def save_tensor_as_image(t: torch.Tensor, path: str, denormalize: bool = True):
+    """
+    Save a tensor image [C,H,W] to disk as PNG.
+    If denormalize=True, apply inverse ImageNet normalization first.
+    """
+    if denormalize:
+        t = denormalize_image(t)
+
+    t = t.clamp(0.0, 1.0)
+    # Convert from [C,H,W] to [H,W,C]
+    np_img = t.permute(1, 2, 0).cpu().numpy()
+    np_img = (np_img * 255).astype(np.uint8)
+    img = Image.fromarray(np_img)
+    img.save(path)
+
+
+def make_patch_grid(patches: torch.Tensor,
+                    max_patches: int = 16) -> torch.Tensor:
+    """
+    Build a big grid image from a set of patches.
+
+    Args:
+        patches:     [N, C, H, W]
+        max_patches: Max number of patches to visualize
+
+    Returns:
+        grid: [C, H_grid, W_grid] tensor
+    """
+    N, C, H, W = patches.shape
+    N_use = min(N, max_patches)
+    patches = patches[:N_use]
+
+    # Grid size ~ square
+    cols = int(math.ceil(math.sqrt(N_use)))
+    rows = int(math.ceil(N_use / cols))
+
+    grid = torch.zeros(C, rows * H, cols * W, dtype=patches.dtype)
+
+    for i in range(N_use):
+        r = i // cols
+        c = i % cols
+        grid[:, r * H:(r + 1) * H, c * W:(c + 1) * W] = patches[i]
+
+    return grid
+
+
+def visualize_batch(batch: dict,
+                    out_dir: str,
+                    split: str,
+                    batch_idx: int,
+                    max_images_per_batch: int = 4,
+                    max_patches_per_image: int = 16):
+    """
+    Visualize a batch from the collator and return metadata describing
+    what transformations were applied.
+
+    Saves, for each image:
+      - A grid of degraded patches.
+      - The original image if 'originals' is present in the batch.
+
+    Returns:
+        logs: list of dicts with:
+              - split
+              - batch_idx
+              - image_idx
+              - path
+              - transform_code
+              - transformations (list of str)
+              - patches_file
+              - original_file (optional)
+    """
+    images = batch["images"]        # [B, N, C, P, P]
+    attn_mask = batch["attn_mask"]  # [B, N]
+    transforms = batch["transforms"]  # [B]
+    originals = batch.get("originals", None)  # [B, C, H, W] if present
+    paths = batch.get("paths", [None] * images.shape[0])
+
+    B, N, C, P, P = images.shape
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    logs = []
+    num_imgs = min(B, max_images_per_batch)
+    for b in range(num_imgs):
+        # Optional: save original image if available
+        orig_path = None
+        if originals is not None:
+            orig = originals[b]  # [C, H, W], normalized
+            orig_path = os.path.join(
+                out_dir,
+                f"{split}_b{batch_idx}_i{b}_original.png"
+            )
+            save_tensor_as_image(orig, orig_path, denormalize=True)
+
+        # Select valid patches using attn_mask
+        valid_idx = torch.nonzero(attn_mask[b], as_tuple=False).squeeze(-1)
+        if valid_idx.numel() == 0:
+            continue
+
+        patches_b = images[b, valid_idx]  # [Ni, C, P, P]
+        grid = make_patch_grid(patches_b, max_patches=max_patches_per_image)
+
+        t_code = int(transforms[b].item())
+        grid_path = os.path.join(
+            out_dir,
+            f"{split}_b{batch_idx}_i{b}_patches_t{t_code}.png"
+        )
+        save_tensor_as_image(grid, grid_path, denormalize=True)
+
+        log_entry = {
+            "split": split,
+            "batch_idx": int(batch_idx),
+            "image_idx": int(b),
+            "path": paths[b],
+            "transform_code": t_code,
+            "transformations": decode_transform_mask(t_code),
+            "patches_file": os.path.abspath(grid_path),
+            "original_file": os.path.abspath(orig_path) if orig_path is not None else None,
+        }
+        logs.append(log_entry)
+
+    return logs
+
+
+def debug_visualize_dataloaders(datamodule: FullImageDataModule,
+                                output_dir: str,
+                                num_batches: int = 1,
+                                max_images_per_batch: int = 4,
+                                max_patches_per_image: int = 16):
+    """
+    Iterate over train/val dataloaders and save a few visualizations
+    of how patches+degradations look.
+
+    Also writes a debug_transforms.yaml file with the info about
+    which transformations were applied to which images.
+    """
+    # Ensure datasets are ready
+    datamodule.setup()
+
+    summary = {"train": [], "val": []}
+
+    # Train loader
+    train_loader = datamodule.train_dataloader()
+    train_out_dir = os.path.join(output_dir, "debug_viz_train")
+    for batch_idx, batch in enumerate(train_loader):
+        logs = visualize_batch(
+            batch,
+            out_dir=train_out_dir,
+            split="train",
+            batch_idx=batch_idx,
+            max_images_per_batch=max_images_per_batch,
+            max_patches_per_image=max_patches_per_image,
+        )
+        summary["train"].extend(logs)
+        if batch_idx + 1 >= num_batches:
+            break
+
+    # Val loader
+    val_loader = datamodule.val_dataloader()
+    val_out_dir = os.path.join(output_dir, "debug_viz_val")
+    for batch_idx, batch in enumerate(val_loader):
+        logs = visualize_batch(
+            batch,
+            out_dir=val_out_dir,
+            split="val",
+            batch_idx=batch_idx,
+            max_images_per_batch=max_images_per_batch,
+            max_patches_per_image=max_patches_per_image,
+        )
+        summary["val"].extend(logs)
+        if batch_idx + 1 >= num_batches:
+            break
+
+    # Write YAML summary
+    yaml_path = os.path.join(output_dir, "debug_transforms.yaml")
+    with open(yaml_path, "w") as f:
+        yaml.safe_dump(summary, f)
+
+    print(f"[DEBUG] Saved debug visualizations to {train_out_dir} and {val_out_dir}")
+    print(f"[DEBUG] Saved transform summary to {yaml_path}")

@@ -25,7 +25,11 @@ class ImageModule(pl.LightningModule):
     def __init__(self, model_id='google/vit-base-patch16-224-in21k', optimizer_config={}, scheduler_config={}, loss_config={}, config=None):
         super(ImageModule, self).__init__()
         self.save_hyperparameters()
-        self.model = AutoModel.from_pretrained(model_id)
+        match model_id:
+            case "google/siglip2-base-patch16-224":
+                self.model = AutoModel.from_pretrained("google/siglip2-base-patch16-224").vision_model
+            case _:
+                self.model = AutoModel.from_pretrained(model_id)
 
         self.optimizer_config = optimizer_config
         self.scheduler_config = scheduler_config
@@ -98,7 +102,7 @@ class ImageModule(pl.LightningModule):
             self.model_metrics[split].update(model_preds, model_labels)
 
     def training_step(self, batch, batch_idx):
-        images, labels = batch
+        images, labels = batch['images'], batch['labels']
 
         out = self(images, labels)
 
@@ -113,7 +117,7 @@ class ImageModule(pl.LightningModule):
         return out['loss']
     
     def validation_step(self, batch, batch_idx):
-        images, labels = batch
+        images, labels = batch['images'], batch['labels']
         out = self(images, labels)
         self._update_metrics('val', out, labels)
         self.log_dict({
@@ -124,7 +128,7 @@ class ImageModule(pl.LightningModule):
         return out['loss']
     
     def test_step(self, batch, batch_idx):
-        images, labels = batch
+        images, labels = batch['images'], batch['labels']
         out = self(images, labels)
         self._update_metrics('test', out, labels)
         self.log_dict({
@@ -158,15 +162,15 @@ class ImageModule(pl.LightningModule):
         self.model_metrics['test_split'].reset()  
 
 class FullImageModule(pl.LightningModule):
-    def __init__(self, backbone=None,
+    def __init__(self, backbone_path=None,
                  optimizer_config={}, scheduler_config={}, loss_config={}, freeze_backbone=False,
-                 aggregator='attn', aggregator_dim=512):
+                 aggregator='attn', aggregator_dim=512, device=0):
         super().__init__()
         self.save_hyperparameters()
-        if backbone is None:
+        if backbone_path is None:
             self.backbone = AutoModel.from_pretrained('google/vit-base-patch16-224-in21k')
         else:
-            self.backbone = backbone
+            self.backbone = ImageModule.load_from_checkpoint(backbone_path, strict=False, map_location=f'cuda:{device}').model
 
         if freeze_backbone:
             for p in self.backbone.parameters(): p.requires_grad = False
