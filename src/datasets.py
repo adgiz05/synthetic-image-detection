@@ -1,277 +1,243 @@
-from .utils import NViewsTransform, IMAGENET_MEAN, IMAGENET_STD
-from .augmentations import PatchAugmentation
+"""Dataset classes for full-image classification."""
 
-import cv2
-import torch
+import os
+import logging
+from typing import Dict, Any
+
 import numpy as np
 import pandas as pd
-from PIL import Image, ImageFile
-from torchvision import transforms as T
-import os
-from pathlib import Path
+from PIL import Image
+import torch.utils.data
 
-import random
-
-ImageFile.LOAD_TRUNCATED_IMAGES = True
-Image.MAX_IMAGE_PIXELS = 933120000
-
-# class ImageDataset(torch.utils.data.Dataset):
-#     def __init__(self,
-#                  split: str = 'train', # Dataset split (corresponding to a CSV file in data/)
-#                  task: str = 'all', # Task to perform: 'all', 'label', 'content_type', 'model', 'specific_model'
-#                  augmentation: str = 'patched', # Augmentation to apply: 'patched' or 'none'
-#                  size: int = 224, # Size of the image or patch
-#                  augmentation_config: dict = {}, # Additional config for augmentation
-#                  return_residual: bool = False, # Whether to return the residual (original - augmented)
-#                  return_original: bool = False, # Whether to return the original image
-#                  dataset_size: str = 'full' # 'full' or 'reduced' dataset size
-#                  ):
-#         # Load data
-#         match dataset_size:
-#             case 'full':
-#                 self.data = pd.read_csv(f'data/{split}.csv')
-#             case 'reduced':
-#                 self.data = pd.read_csv(f'data/reduced_splits/{split}.csv')
-#             case 'filtered':
-#                 self.data = pd.read_csv(f'data/filtered_splits/{split}.csv')
-#             case _:
-#                 raise ValueError(f"Unknown dataset_size: {dataset_size}")
-
-#         # Define label with respect to the task
-#         if task == 'all':
-#             self.task = ['label', 'content_type', 'model', 'specific_model']
-#         elif task in ['label', 'content_type', 'model', 'specific_model']:
-#             self.task = [task]
-#         else:
-#             raise ValueError(f"Unknown task: {task}")
-        
-#         self.size = size
-#         # Augmentations
-#         match augmentation:
-#             case 'patched':
-#                 self.augmentation = PatchAugmentation(size=size, **augmentation_config)
-#             case _:
-#                 self.augmentation = lambda x: x # No augmentation
-
-#         self.to_tensor = T.Compose([
-#             T.ToTensor(),  # HWC uint8 -> CHW float [0,1]
-#             T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
-#         ])
-
-#         self.return_residual = return_residual # TODO: try adding the residual
-#         self.return_original = return_original 
-
-#     def __len__(self):
-#         return len(self.data)
-    
-#     def __getitem__(self, idx):
-#         row = self.data.iloc[idx]
-#         path = row['image_path']
-
-#         try:
-#             original = np.asarray(Image.open(path).convert('RGB'))  # np.uint8 HxWxC
-#             aug_img = self.augmentation(original)                   # aún np.uint8 HxWxC
-#         except:
-#             print(f"[WARN] Could not load image {path}")
-#             original = np.zeros((self.size, self.size, 3), dtype=np.uint8)
-#             aug_img = original
-
-#         # A tensor normalizado (CHW float), aquí ya en el worker
-#         pil_img = Image.fromarray(aug_img)
-#         image_tensor = self.to_tensor(pil_img)                      # torch.float32 [C,H,W]
-
-#         # Etiquetas como lista (el collate las apila a tensor)
-#         label = [row[t] for t in self.task]
-
-#         out = {
-#             'image': image_tensor,
-#             'label': label
-#         }
-
-#         if self.return_original:
-#             out['original'] = original
-
-#         return out
-
-class ImageDataset(torch.utils.data.Dataset):
-    def __init__(self, data_path, task='all', max_image_size=1440):
-        self.data = pd.read_csv(data_path)
-
-        if task == 'all':
-            self.task = ['label', 'content_type', 'model', 'specific_model']
-        elif task in ['label', 'content_type', 'model', 'specific_model']:
-            self.task = [task]
-        else:
-            raise ValueError(f"Unknown task: {task}")
-
-        self.max_image_size = max_image_size
-
-    def __len__(self):
-        return len(self.data)
-    
-    def __getitem__(self, idx):
-        row = self.data.iloc[idx]
-        path = row['image_path']
-
-        try:
-            img = Image.open(path).convert('RGB')
-            w, h = img.size
-            max_side = max(w, h)
-            if max_side > self.max_image_size:
-                scale = self.max_image_size / max_side
-                img = img.resize(
-                    (int(w * scale), int(h * scale)),
-                    Image.Resampling.LANCZOS
-                )
-        except:
-            print(f"[WARN] Could not load image {path}")
-            img = Image.new("RGB", (512, 512), color=(0,0,0))
-
-        # Labels: you decide how to output them
-        label = [row[t] for t in self.task]
-
-        return {'image': img, 'label': label}
 
 class FullImageDataset(torch.utils.data.Dataset):
-    def __init__(self, split='train', task='all', size=224, dataframe=None):
-        if split == 'test':
-            self.data = pd.read_csv(f'data/{split}.csv')
-        elif split == 'custom':
-            self.data = dataframe
-        else:
-            self.data = pd.read_csv(f'data/full_img_splits/{split}.csv')
-
-        if task == 'all':
-            self.task = ['label', 'content_type', 'model', 'specific_model']
-        elif task in ['label','content_type','model','specific_model']:
-            self.task = [task]
-        else:
-            raise ValueError(f"Unknown task: {task}")
-
-        # Solo normalización (sin recortar a size; el tiling lo hará el collator)
-        self.to_tensor = T.Compose([
-            T.ToTensor(),
-            T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
-        ])
-
-    def __len__(self): return len(self.data)
-
-    def __getitem__(self, idx):
-        row = self.data.iloc[idx]
-        path = row['image_path']
-        try:
-            img = np.asarray(Image.open(path).convert('RGB'))
-        except:
-            h = w = 512
-            img = np.zeros((h, w, 3), dtype=np.uint8)
-        tensor = self.to_tensor(Image.fromarray(img))  # [C,H,W] float
-        label = [row[t] for t in self.task]
-        return {'image': tensor, 'label': label}
-
-
-class SelfContrastivePretrainingDataset(torch.utils.data.Dataset):
-    def __init__(self, split='train', task='all', augmentation='patched', size=96, n_views=1, randaug=False):
-        self.data = pd.read_csv(f'data/{split}.csv')
-
-        # Define label with respect to the task
-        if task == 'all':
-            self.task = ['label', 'content_type', 'model', 'specific_model']
-        elif task in ['label', 'content_type', 'model', 'specific_model']:
-            self.task = [task]
-        else:
-            raise ValueError(f"Unknown task: {task}")
-        
-        # Augmentations
-        match augmentation:
-            case 'patched':
-                self.augmentation = PatchAugmentation(size=size)
-            case _:
-                self.augmentation = lambda x: x # No augmentation
-
-        # Transformation      
-        self.transform = NViewsTransform(
-            pre_transform=self.augmentation,
-            n_views=n_views,
-            randaug=randaug
-        )
-
-    def __len__(self):
-        return len(self.data)
+    """
+    Dataset for full-image classification from CSV.
     
-    def __getitem__(self, idx):
-        row = self.data.iloc[idx]
+    Supports:
+    - Binary classification (synthetic vs real)
+    - Optional model prediction auxiliary task
+    - Optional benchmark information
+    """
+    
+    def __init__(
+        self, 
+        data_path: str, 
+        predict_model: bool = False, 
+        return_benchmark: bool = False,
+        root_dir: str = ""
+    ):
+        data = pd.read_csv(data_path)
+
+        if "image_path" not in data.columns:
+            raise ValueError("CSV must contain 'image_path'.")
+
+        self.image_paths = data["image_path"].tolist()
+        self.root_dir = root_dir
         
-        # IMAGE LOADING
-        image = np.asarray(Image.open(row['image_path']).convert('RGB')) # Load as a numpy array
+        # Main binary label: synthetic vs non-synthetic (assumed int 0/1)
+        self.has_labels = "label" in data.columns
+        if self.has_labels:
+            self.labels = data["label"].astype(int).tolist()
+        else:
+            self.labels = [-1] * len(self.image_paths)
 
-        # IMAGE TRANSFORMATION
-        image = self.transform(image)
+        self.predict_model = predict_model
+        self.return_benchmark = return_benchmark
 
-        # LABEL FORMAT
-        label = torch.tensor([row[t] for t in self.task], dtype=torch.long)
+        # Optional model label head
+        if self.predict_model:
+            if "model" not in data.columns:
+                raise ValueError("predict_model=True but 'model' column not found in CSV")
+            # Factorize model column into integer class indices (deterministic: sorted unique)
+            self.model_label_raw = data["model"].astype(str).tolist()
+            self.model_label_names = sorted(data["model"].dropna().unique().tolist())
+            _label_to_idx = {name: i for i, name in enumerate(self.model_label_names)}
+            self.model_labels = [_label_to_idx.get(str(m), 0) for m in self.model_label_raw]
 
-        return image, label
+        # Optional benchmark field
+        self.has_benchmark = "benchmark" in data.columns
+        if self.has_benchmark:
+            self.benchmarks = data["benchmark"].astype(str).tolist()
+        else:
+            self.benchmarks = None
 
-class NoiseDataset(torch.utils.data.Dataset):
-    def __init__(self, split='train', patch_size=128, transform=None):
-        self.data = pd.read_csv(f"data/{split}.csv")
-        self.patch_size = patch_size
-        self.transform = transform
+    def __len__(self) -> int:
+        return len(self.image_paths)
 
-    def __len__(self):
-        return len(self.data)
+    def _blank_image_fallback(self, h: int = 512, w: int = 512) -> Image.Image:
+        """Return a blank RGB image if something goes wrong when loading."""
+        arr = np.zeros((h, w, 3), dtype=np.uint8)
+        return Image.fromarray(arr)
 
-    def __getitem__(self, idx):
-        img_path = self.data.iloc[idx]["image_path"]
-        label = self.data.iloc[idx]["label"]
+    def _resolve_path(self, p: str) -> str:
+        """Resolve relative paths using root_dir if provided."""
+        # If path is absolute, use it as-is
+        if os.path.isabs(p):
+            return p
+        
+        # If no root_dir specified, use path as-is
+        if not self.root_dir:
+            return p
+        
+        # If path already starts with root_dir, don't duplicate
+        # Handle both with and without trailing slash
+        root_normalized = os.path.normpath(self.root_dir)
+        path_normalized = os.path.normpath(p)
+        
+        # Check if path already contains the root_dir at the start
+        if path_normalized.startswith(root_normalized + os.sep) or path_normalized.startswith(root_normalized):
+            # Path already includes root_dir, use as-is
+            return p
+        
+        # Otherwise, join root_dir with path
+        return os.path.join(self.root_dir, p)
 
-        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            raise FileNotFoundError(f"Could not load image {img_path}")
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        raw_path = self.image_paths[idx]
+        path = self._resolve_path(raw_path)
+        
+        is_fallback = False
+        load_error = ""
+        
+        try:
+            img = Image.open(path).convert("RGB")
+        except Exception as e:
+            logging.warning(f"Failed to load image '{path}': {e}. Using blank fallback.")
+            img = self._blank_image_fallback()
+            is_fallback = True
+            load_error = repr(e)
 
-        # random crop
-        h_img, w_img = img.shape
-        ph = self.patch_size
-        if h_img < ph or w_img < ph:
-            img = cv2.resize(img, (max(w_img, ph), max(h_img, ph)))
-            h_img, w_img = img.shape
+        label = self.labels[idx]
 
-        y = random.randint(0, h_img - ph)
-        x = random.randint(0, w_img - ph)
-        patch = img[y:y+ph, x:x+ph]
+        sample = {
+            "image": img, 
+            "label": label, 
+            "path": raw_path,
+            "abs_path": path,
+            "is_fallback": is_fallback,
+            "load_error": load_error,
+        }
+        
+        if self.predict_model and hasattr(self, 'model_labels'):
+            sample["model_label"] = self.model_labels[idx]
+            
+        if self.return_benchmark and self.benchmarks is not None:
+            sample["benchmark"] = self.benchmarks[idx]
 
-        # normalize [0,1]
-        patch = patch.astype(np.float32) / 255.0
-        patch_tensor = torch.from_numpy(patch).unsqueeze(0)  # (1, H, W)
+        return sample
 
-        if self.transform:
-            patch_tensor = self.transform(patch_tensor)
 
-        return patch_tensor, torch.tensor(label, dtype=torch.long)
-
-class NoiseDatasetPT(torch.utils.data.Dataset):
-    def __init__(self, split='train', cache_dir='data/noise/images', patch_size=128):
+class MultiScaleTubeDataset(torch.utils.data.Dataset):
+    """
+    Dataset for multi-scale tube-based contrastive learning.
+    
+    Each sample returns the full image and metadata. The collator is responsible
+    for extracting multi-scale tubes (patches at different scales centered at
+    the same spatial location).
+    
+    Supports:
+    - Binary classification (synthetic vs real)
+    - Optional model/generator prediction auxiliary task
+    """
+    
+    def __init__(
+        self, 
+        data_path: str, 
+        predict_model: bool = False,
+        root_dir: str = ""
+    ):
         """
-        Dataset de tensores cacheados (.pt), siempre en escala de grises.
-        Si la imagen >= patch_size: crop.
-        Si la imagen < patch_size en alguna dimensión: pad hasta patch_size.
+        Args:
+            data_path: Path to CSV file with columns: image_path, label, [model]
+            predict_model: If True, expects 'model' column for generator classification
+            root_dir: Root directory to prepend to relative paths
         """
-        self.cache_dir = Path(cache_dir) / split
-        self.data = pd.read_csv(f"data/noise/{split}.csv")
-        self.split = split
-        self.patch_size = patch_size
+        data = pd.read_csv(data_path)
 
-        self.to_float = T.ConvertImageDtype(torch.float32)
-        self.to_gray = T.Grayscale(num_output_channels=1)
+        if "image_path" not in data.columns:
+            raise ValueError("CSV must contain 'image_path'.")
 
-    def __len__(self):
-        return len(self.data)
+        self.image_paths = data["image_path"].tolist()
+        self.root_dir = root_dir
+        
+        # Main binary label: synthetic vs real (0 or 1)
+        self.has_labels = "label" in data.columns
+        if self.has_labels:
+            self.labels = data["label"].astype(int).tolist()
+        else:
+            self.labels = [-1] * len(self.image_paths)
 
-    def __getitem__(self, idx):
-        row = self.data.iloc[idx]
-        tensor = torch.load(self.cache_dir / (Path(row.image_path).stem + ".pt"))  # [C,H,W], uint8
+        self.predict_model = predict_model
 
-        tensor = self.to_float(tensor)  # [C,H,W] en float32 [0,1]
-        tensor = self.to_gray(tensor)   # [1,H,W]
+        # Optional model/generator label
+        if self.predict_model:
+            if "model" not in data.columns:
+                raise ValueError("predict_model=True but 'model' column not found in CSV")
+            # Factorize model column into integer class indices
+            self.model_label_raw = data["model"].astype(str).tolist()
+            self.model_label_names = sorted(data["model"].dropna().unique().tolist())
+            _label_to_idx = {name: i for i, name in enumerate(self.model_label_names)}
+            self.model_labels = [_label_to_idx.get(str(m), 0) for m in self.model_label_raw]
 
-        return tensor, int(row.label)
+    def __len__(self) -> int:
+        return len(self.image_paths)
+
+    def _blank_image_fallback(self, h: int = 512, w: int = 512) -> Image.Image:
+        """Return a blank RGB image if loading fails."""
+        arr = np.zeros((h, w, 3), dtype=np.uint8)
+        return Image.fromarray(arr)
+
+    def _resolve_path(self, p: str) -> str:
+        """Resolve relative paths using root_dir if provided."""
+        # If path is absolute, use it as-is
+        if os.path.isabs(p):
+            return p
+        
+        # If no root_dir specified, use path as-is
+        if not self.root_dir:
+            return p
+        
+        # If path already starts with root_dir, don't duplicate
+        # Handle both with and without trailing slash
+        root_normalized = os.path.normpath(self.root_dir)
+        path_normalized = os.path.normpath(p)
+        
+        # Check if path already contains the root_dir at the start
+        if path_normalized.startswith(root_normalized + os.sep) or path_normalized.startswith(root_normalized):
+            # Path already includes root_dir, use as-is
+            return p
+        
+        # Otherwise, join root_dir with path
+        return os.path.join(self.root_dir, p)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        raw_path = self.image_paths[idx]
+        path = self._resolve_path(raw_path)
+        
+        is_fallback = False
+        load_error = ""
+        
+        try:
+            img = Image.open(path).convert("RGB")
+        except Exception as e:
+            logging.warning(f"Failed to load image '{path}': {e}. Using blank fallback.")
+            img = self._blank_image_fallback()
+            is_fallback = True
+            load_error = repr(e)
+
+        label = self.labels[idx]
+
+        sample = {
+            "image": img,  # Full PIL Image - collator will extract tubes
+            "label": label, 
+            "path": raw_path,
+            "abs_path": path,
+            "is_fallback": is_fallback,
+            "load_error": load_error,
+        }
+        
+        if self.predict_model and hasattr(self, 'model_labels'):
+            sample["model_label"] = self.model_labels[idx]
+
+        return sample

@@ -73,6 +73,53 @@ Before testing you should run `testing_utils/testing/setup_testing.py` to downlo
 
 We also provide our training scripts in `training_utils`. You can train the model with either SelfCon or Cross-Entropy Loss. The calibration scripts are placed in the same directory.
 
+### Multi-Scale Tube Contrastive Learning (Experimental)
+
+We are developing a new approach based on multi-scale tubes with dual-branch encoders (spatial/residual + wavelet/frequency). See [new_idea.md](new_idea.md) for the full architecture description.
+
+**Quick Start - Data Visualization:**
+
+```bash
+# 0. Verify image paths in CSV (recommended first step)
+python scripts/check_paths.py data/train.csv
+
+# 1. Quick test (verify pipeline works)
+python scripts/quick_test_data.py
+
+# 2. Generate visualizations
+./experiments/visualize_batch.sh
+
+# 3. Check output
+ls visualizations/
+
+# If images appear black, run diagnostic:
+./scripts/diagnose_black_images.sh
+# Or try debug mode:
+./experiments/visualize_batch.sh --no-norm
+```
+
+**Troubleshooting:**
+- **Images appear black**: See [docs/SOLUCION_IMAGENES_NEGRAS.md](docs/SOLUCION_IMAGENES_NEGRAS.md)
+- **Path errors (data/data/...)**: See [docs/SOLUCION_PATHS.md](docs/SOLUCION_PATHS.md)
+- **General issues**: See [docs/VISUALIZACION_TUBOS.md](docs/VISUALIZACION_TUBOS.md)
+
+**What you'll see:**
+- Multi-scale tubes: patches at different scales (64×64, 128×128, 256×256) centered at the same location
+- Augmented views: controlled degradations (JPEG, blur, noise) applied to each patch
+- Scale/view comparisons to verify correctness
+
+For detailed documentation, see [docs/VISUALIZACION_TUBOS.md](docs/VISUALIZACION_TUBOS.md)
+
+**Implementation status:**
+- ✅ MultiScaleTubeDataset - loads full images with labels
+- ✅ MultiScaleTubeCollator - extracts multi-scale tubes with augmentations
+- ✅ MultiScaleTubeDataModule - PyTorch Lightning data module
+- ✅ Visualization tools - verify data pipeline
+- 🚧 Dual-branch encoder (spatial + wavelet) - in progress
+- 🚧 Embedding factorization (z_auth + z_src) - planned
+- 🚧 Contrastive losses - planned
+- 🚧 MIL aggregation - planned
+
 ## Cite
 
 ```bibtex

@@ -6,22 +6,24 @@
 # --- CONFIGURABLE VARIABLES ---
 
 # Paths to your CSVs
-TRAIN_CSV="data/dataset_v3/train.csv"
-VAL_CSV="data/dataset_v3/eval_robustness_subset.csv"
+TRAIN_CSV="data/dataset_v5/train.csv"
+VAL_CSV="data/dataset_v5/val.csv"
 
 # Output folder where checkpoints, logs, args.yaml, etc. will be saved
-OUTPUT_DIR="out/lawwwing-full-img-cls/baseline/"
+OUTPUT_DIR="out/lawwwing-full-img-cls/"
 
 # Model and training settings
 MODEL_ID="google/vit-base-patch16-224-in21k"
-PATCH_SIZE=128
-MAX_PATCHES=16
-BATCH_SIZE=32
-EPOCHS=150
+PATCH_SIZE=96
+MAX_PATCHES=24
+BATCH_SIZE=64
+EPOCHS=100
 LR=5e-4
 ATTN_DIM=128
 NUM_WORKERS=8
-DEVICE=2
+MONITOR="val/auc"
+MODE="max"
+DEVICE=5
 
 CUDA_DEVICE_ORDER=PCI_BUS_ID HF_HOME=/opt/huggingface/cache python scripts/train_full_img.py \
     --train_path ${TRAIN_CSV} \
@@ -36,4 +38,8 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID HF_HOME=/opt/huggingface/cache python scripts/train
     --max_epochs ${EPOCHS} \
     --attn_dim ${ATTN_DIM} \
     --num_workers ${NUM_WORKERS} \
-    --accumulate_grad_batches 2 
+    --monitor ${MONITOR} \
+    --mode ${MODE} \
+    --accumulate_grad_batches 1 \
+    --predict_model \
+    --predict_transform

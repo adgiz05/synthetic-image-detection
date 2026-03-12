@@ -1,13 +1,13 @@
 train_path: data/dataset_v3/train.csv
-validation_path: data/dataset_v3/eval_robustness_subset.csv
+validation_path: data/dataset_v3/val.csv
 output_dir: out/lawwwing-full-img-cls/baseline/
-device: 2
+device: 5
 model_id: google/vit-base-patch16-224-in21k
 patch_size: 128
 max_patches: 16
 lr: 0.0005
 attn_dim: 128
-max_epochs: 150
+max_epochs: 50
 batch_size: 32
 accumulate_grad_batches: 2
 num_workers: 8
