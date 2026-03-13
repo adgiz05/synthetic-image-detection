@@ -1,10 +1,11 @@
 """
 Script to visualize multi-scale tube batches.
 
-This script loads a batch from the training data and plots:
-- Multi-scale tubes (different scales at same location)
-- Augmented views (different degradations of same patch)
-- Labels and metadata
+Plots per batch:
+  1. Original images with tube extraction regions overlaid
+  2. Per-tube full representation: RGB | Residual | Wavelet(LH/HL/HH)  for every (scale, view)
+  3. Scale comparison (RGB only)
+  4. View comparison (RGB only)
 
 Usage:
     python scripts/visualize_batch.py --train_csv data/train.csv --root_dir data/
@@ -21,7 +22,6 @@ import matplotlib.patches as mpatches
 import numpy as np
 from PIL import Image
 
-# Local imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from src.datasets import MultiScaleTubeDataset
@@ -29,461 +29,510 @@ from src.collators import MultiScaleTubeCollator
 from src.constants import IMAGENET_MEAN, IMAGENET_STD
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 def denormalize(tensor, mean=IMAGENET_MEAN, std=IMAGENET_STD):
-    """
-    Denormalize a tensor with ImageNet stats.
-    
-    Args:
-        tensor: [C, H, W] or [B, C, H, W]
-        
-    Returns:
-        denormalized tensor
-    """
-    # Clone to avoid modifying original
+    """Reverse ImageNet normalization on a [3, H, W] or [B, 3, H, W] tensor."""
     tensor = tensor.clone()
-    
-    # Create tensors with same device and dtype as input
-    mean = torch.tensor(mean, dtype=tensor.dtype, device=tensor.device).view(-1, 1, 1)
-    std = torch.tensor(std, dtype=tensor.dtype, device=tensor.device).view(-1, 1, 1)
-    
-    if tensor.dim() == 4:  # batch
-        mean = mean.unsqueeze(0)
-        std = std.unsqueeze(0)
-    
-    # Denormalize: tensor * std + mean
-    # This reverses the normalization: (tensor - mean) / std
-    denorm_tensor = tensor * std + mean
-    
-    return denorm_tensor
+    mean_t = torch.tensor(mean, dtype=tensor.dtype).view(-1, 1, 1)
+    std_t  = torch.tensor(std,  dtype=tensor.dtype).view(-1, 1, 1)
+    if tensor.dim() == 4:
+        mean_t = mean_t.unsqueeze(0)
+        std_t  = std_t.unsqueeze(0)
+    return tensor * std_t + mean_t
 
 
-def tensor_to_image(tensor, denorm=True):
+def rgb_to_image(tensor_3ch, denorm=True):
     """
-    Convert a tensor to numpy image for plotting.
-    
-    Args:
-        tensor: [C, H, W] tensor
-        denorm: whether to denormalize
-        
-    Returns:
-        [H, W, C] numpy array in [0, 1]
+    [3, H, W] float tensor → [H, W, 3] numpy in [0, 1].
+    Expects the first 3 channels to be ImageNet-normalized RGB.
     """
-    # Move to CPU first if needed
-    tensor = tensor.detach().cpu()
-    
+    t = tensor_3ch.detach().cpu()
     if denorm:
-        tensor = denormalize(tensor)
-    
-    # Convert to numpy: [C, H, W] -> [H, W, C]
-    img = tensor.permute(1, 2, 0).numpy()
-    
-    # Clip to valid range
-    img = np.clip(img, 0, 1)
-    
+        t = denormalize(t)
+    img = t.permute(1, 2, 0).numpy()
+    return np.clip(img, 0, 1)
+
+
+def residual_to_image(tensor_3ch, amplify=3.0):
+    """
+    [3, H, W] zero-centered residual → [H, W, 3] numpy in [0, 1].
+    Shifts to gray=0.5 and amplifies so subtle artifacts become visible.
+    """
+    t = tensor_3ch.detach().cpu()
+    img = (t * amplify + 0.5).clamp(0, 1).permute(1, 2, 0).numpy()
     return img
 
 
-def plot_tube(tube, tube_idx, image_idx, label, center, save_path=None, denorm=True):
+def wavelet_to_image(tensor_3ch):
     """
-    Plot a single multi-scale tube with all its views.
-    
+    [3, H, W] wavelet bands (LH/HL/HH, range ≈ [-3, 3]) → [H, W, 3] false-color numpy.
+    R=LH (horizontal edges), G=HL (vertical edges), B=HH (diagonal).
+    """
+    t = tensor_3ch.detach().cpu()
+    img = ((t + 3.0) / 6.0).clamp(0, 1).permute(1, 2, 0).numpy()
+    return img
+
+
+# ---------------------------------------------------------------------------
+# Plot functions
+# ---------------------------------------------------------------------------
+
+def plot_tube_representations(
+    tube_spatial,
+    tube_wavelet,
+    tube_idx,
+    image_idx,
+    label,
+    center,
+    scales,
+    output_dir,
+    denorm=True,
+):
+    """
+    Comprehensive view of one tube across all scales and views.
+
+    Grid layout: rows = K scales, cols = V views × 3 (RGB | Residual | Wavelet)
+
     Args:
-        tube: [K_scales, V_views, C, P, P] tensor
-        tube_idx: index of this tube in the image
-        image_idx: index of the image in the batch
-        label: image label (0=real, 1=synthetic)
-        center: (cy, cx) normalized coordinates
-        save_path: optional path to save figure
-        denorm: whether to denormalize (should match collator's normalize setting)
+        tube_spatial: [K, V, 6, P, P]  – first 3ch RGB (norm), last 3ch residual
+        tube_wavelet: [K, V, 3, P, P]  – LH / HL / HH bands
+        scales: list of scale values (e.g. [64, 128, 256])
     """
-    K, V, C, P, _ = tube.shape
-    
-    fig, axes = plt.subplots(K, V, figsize=(V * 3, K * 3))
-    if K == 1:
+    K, V, _, P, _ = tube_spatial.shape
+
+    ncols = V * 3   # per view: RGB, Residual, Wavelet
+    nrows = K
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 2.5, nrows * 2.8))
+
+    # Ensure 2-D axes array
+    if nrows == 1:
         axes = axes.reshape(1, -1)
-    if V == 1:
+    if ncols == 1:
         axes = axes.reshape(-1, 1)
-    
+
     fig.suptitle(
-        f"Image {image_idx} | Tube {tube_idx} | "
-        f"Label: {'Synthetic' if label == 1 else 'Real'} | "
-        f"Center: ({center[0]:.2f}, {center[1]:.2f})",
-        fontsize=14, fontweight='bold'
+        f"Image {image_idx}  |  Tube {tube_idx}  |  "
+        f"Label: {'Synthetic' if label == 1 else 'Real'}  |  "
+        f"Center: ({center[0]:.2f}, {center[1]:.2f})\n"
+        f"Columns per view:  RGB  |  Residual (×3 ampl.)  |  Wavelet LH/HL/HH (false-color)",
+        fontsize=11, fontweight='bold',
     )
-    
+
     for k in range(K):
+        scale_label = f"{scales[k]}px" if k < len(scales) else f"s{k}"
         for v in range(V):
-            ax = axes[k, v]
-            
-            # Get patch and convert to image
-            patch = tube[k, v]  # [C, P, P]
-            img = tensor_to_image(patch, denorm=denorm)
-            
-            # Plot
-            ax.imshow(img)
+            col_base = v * 3
+
+            patch_sp = tube_spatial[k, v]   # [6, P, P]
+            rgb = patch_sp[:3]              # [3, P, P]
+            res = patch_sp[3:]              # [3, P, P]
+            wav = tube_wavelet[k, v]        # [3, P, P]
+
+            view_str = "orig" if v == 0 else f"aug{v}"
+
+            # RGB
+            ax = axes[k, col_base]
+            ax.imshow(rgb_to_image(rgb, denorm=denorm))
             ax.axis('off')
-            
-            # Add title
-            if v == 0:
-                ax.set_title(f"Scale {k}\nView {v} (original)", fontsize=10)
-            else:
-                ax.set_title(f"Scale {k}\nView {v} (augmented)", fontsize=10)
-    
+            ax.set_title(f"s{k}({scale_label}) v{v}\nRGB [{view_str}]", fontsize=8)
+
+            # Residual
+            ax = axes[k, col_base + 1]
+            ax.imshow(residual_to_image(res))
+            ax.axis('off')
+            ax.set_title(f"s{k}({scale_label}) v{v}\nResidual", fontsize=8)
+
+            # Wavelet
+            ax = axes[k, col_base + 2]
+            ax.imshow(wavelet_to_image(wav))
+            ax.axis('off')
+            ax.set_title(f"s{k}({scale_label}) v{v}\nWavelet", fontsize=8)
+
     plt.tight_layout()
-    
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"Saved: {save_path}")
-    else:
-        plt.show()
-    
+
+    image_dir = Path(output_dir) / f"image_{image_idx}"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    save_path = image_dir / f"tube_{tube_idx}_representations.png"
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"Saved: {save_path}")
     plt.close()
 
 
-def plot_batch_summary(batch, num_samples=2, num_tubes_per_sample=4, output_dir="visualizations", denorm=True):
+def plot_wavelet_bands(
+    tube_wavelet,
+    tube_idx,
+    image_idx,
+    label,
+    center,
+    scales,
+    output_dir,
+):
     """
-    Plot a summary of the batch showing multiple tubes from multiple images.
-    
-    Args:
-        batch: batch dict from collator
-        num_samples: number of images to visualize
-        num_tubes_per_sample: number of tubes to show per image
-        output_dir: directory to save plots
-        denorm: whether to denormalize (should match collator's normalize setting)
+    Show each wavelet band (LH, HL, HH) separately as grayscale for every
+    (scale, view), using a diverging colormap to make edges pop.
+
+    Grid: rows = K scales, cols = V * 3 bands
     """
-    tubes = batch['tubes']  # [B, N, K, V, C, P, P]
-    centers = batch['tube_centers']  # [B, N, 2]
-    labels = batch['labels']  # [B]
-    
+    K, V, _, P, _ = tube_wavelet.shape
+    band_names = ["LH (horiz)", "HL (vert)", "HH (diag)"]
+
+    ncols = V * 3
+    nrows = K
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 2.5, nrows * 2.8))
+    if nrows == 1:
+        axes = axes.reshape(1, -1)
+    if ncols == 1:
+        axes = axes.reshape(-1, 1)
+
+    fig.suptitle(
+        f"Wavelet bands  |  Image {image_idx}  |  Tube {tube_idx}  |  "
+        f"Label: {'Synthetic' if label == 1 else 'Real'}",
+        fontsize=11, fontweight='bold',
+    )
+
+    for k in range(K):
+        scale_label = f"{scales[k]}px" if k < len(scales) else f"s{k}"
+        for v in range(V):
+            for b in range(3):
+                col = v * 3 + b
+                band = tube_wavelet[k, v, b].detach().cpu().numpy()  # [P, P]
+                ax = axes[k, col]
+                ax.imshow(band, cmap='RdBu_r', vmin=-3, vmax=3)
+                ax.axis('off')
+                ax.set_title(
+                    f"s{k}({scale_label}) v{v}\n{band_names[b]}", fontsize=7
+                )
+
+    plt.tight_layout()
+
+    image_dir = Path(output_dir) / f"image_{image_idx}"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    save_path = image_dir / f"tube_{tube_idx}_wavelet_bands.png"
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"Saved: {save_path}")
+    plt.close()
+
+
+def plot_batch_summary(
+    batch,
+    num_samples=2,
+    num_tubes_per_sample=4,
+    output_dir="visualizations",
+    denorm=True,
+):
+    """
+    For each selected image, plot the full representation of a subset of tubes.
+    """
+    tubes    = batch['tubes']           # [B, N, K, V, 6, P, P]
+    wav      = batch['tubes_wavelet']   # [B, N, K, V, 3, P, P]
+    centers  = batch['tube_centers']    # [B, N, 2]
+    labels   = batch['labels']          # [B]
+    scales   = batch.get('scales', [])
+
     B, N, K, V, C, P, _ = tubes.shape
-    
+
     print(f"\n{'='*60}")
     print(f"BATCH SUMMARY")
     print(f"{'='*60}")
-    print(f"Batch size: {B}")
-    print(f"Tubes per image: {N}")
-    print(f"Scales per tube: {K}")
-    print(f"Views per scale: {V}")
-    print(f"Patch size: {P}x{P}")
-    print(f"Labels: {labels.tolist()}")
+    print(f"Batch size:         {B}")
+    print(f"Tubes per image:    {N}")
+    print(f"Scales per tube:    {K}  {scales}")
+    print(f"Views per scale:    {V}")
+    print(f"Patch size:         {P}×{P}")
+    print(f"Spatial channels:   {C}  (3 RGB + 3 residual)")
+    print(f"Wavelet channels:   {wav.shape[4]}  (LH / HL / HH)")
+    print(f"Labels:             {labels.tolist()}")
     if 'model_labels' in batch:
-        print(f"Model labels: {batch['model_labels'].tolist()}")
+        print(f"Model labels:       {batch['model_labels'].tolist()}")
     print(f"{'='*60}\n")
-    
-    # Create output directory
+
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-    
-    # Plot individual tubes
+
     num_samples = min(num_samples, B)
     for b in range(num_samples):
         label = labels[b].item()
-        
-        # Create subdirectory for this image
-        image_dir = os.path.join(output_dir, f"image_{b}")
-        Path(image_dir).mkdir(parents=True, exist_ok=True)
-        
-        # Select tubes to visualize (evenly spaced)
-        tube_indices = np.linspace(0, N-1, num_tubes_per_sample, dtype=int)
-        
-        for ti, tube_idx in enumerate(tube_indices):
-            tube = tubes[b, tube_idx]  # [K, V, C, P, P]
-            center = centers[b, tube_idx]  # [2]
-            
-            save_path = os.path.join(image_dir, f"tube_{tube_idx}.png")
-            plot_tube(
-                tube, 
+        tube_indices = np.linspace(0, N - 1, min(num_tubes_per_sample, N), dtype=int)
+
+        for tube_idx in tube_indices:
+            center = centers[b, tube_idx].tolist()
+
+            # Full representation: RGB + residual + wavelet
+            plot_tube_representations(
+                tube_spatial=tubes[b, tube_idx],
+                tube_wavelet=wav[b, tube_idx],
                 tube_idx=tube_idx,
                 image_idx=b,
                 label=label,
-                center=center.tolist(),
-                save_path=save_path,
-                denorm=denorm
+                center=center,
+                scales=scales,
+                output_dir=output_dir,
+                denorm=denorm,
+            )
+
+            # Individual wavelet bands with diverging colormap
+            plot_wavelet_bands(
+                tube_wavelet=wav[b, tube_idx],
+                tube_idx=tube_idx,
+                image_idx=b,
+                label=label,
+                center=center,
+                scales=scales,
+                output_dir=output_dir,
             )
 
 
-def plot_scale_comparison(batch, image_idx=0, tube_idx=0, view_idx=0, output_dir="visualizations", denorm=True):
+def plot_scale_comparison(
+    batch,
+    image_idx=0,
+    tube_idx=0,
+    view_idx=0,
+    output_dir="visualizations",
+    denorm=True,
+):
     """
-    Plot a comparison of all scales for a single tube and view.
-    
-    Args:
-        batch: batch dict from collator
-        image_idx: which image in the batch
-        tube_idx: which tube to visualize
-        view_idx: which view to visualize
-        output_dir: directory to save plots
-        denorm: whether to denormalize (should match collator's normalize setting)
+    For one (tube, view), compare all scales side by side: RGB | Residual | Wavelet.
     """
-    tubes = batch['tubes']  # [B, N, K, V, C, P, P]
-    centers = batch['tube_centers']  # [B, N, 2]
-    labels = batch['labels']  # [B]
-    
-    B, N, K, V, C, P, _ = tubes.shape
-    
-    tube = tubes[image_idx, tube_idx]  # [K, V, C, P, P]
-    center = centers[image_idx, tube_idx]  # [2]
-    label = labels[image_idx].item()
-    
-    fig, axes = plt.subplots(1, K, figsize=(K * 4, 4))
-    if K == 1:
+    tubes   = batch['tubes']           # [B, N, K, V, 6, P, P]
+    wav     = batch['tubes_wavelet']   # [B, N, K, V, 3, P, P]
+    centers = batch['tube_centers']
+    labels  = batch['labels']
+    scales  = batch.get('scales', [])
+
+    K = tubes.shape[2]
+
+    tube_sp  = tubes[image_idx, tube_idx]   # [K, V, 6, P, P]
+    tube_wav = wav[image_idx, tube_idx]     # [K, V, 3, P, P]
+    center   = centers[image_idx, tube_idx].tolist()
+    label    = labels[image_idx].item()
+
+    ncols = K * 3   # per scale: RGB, Residual, Wavelet
+    fig, axes = plt.subplots(1, ncols, figsize=(ncols * 2.8, 3.5))
+    if ncols == 1:
         axes = [axes]
-    
+
     fig.suptitle(
-        f"Scale Comparison | Image {image_idx} | Tube {tube_idx} | View {view_idx}\n"
-        f"Label: {'Synthetic' if label == 1 else 'Real'} | "
+        f"Scale comparison  |  Image {image_idx}  |  Tube {tube_idx}  |  View {view_idx}\n"
+        f"Label: {'Synthetic' if label == 1 else 'Real'}  |  "
         f"Center: ({center[0]:.2f}, {center[1]:.2f})",
-        fontsize=14, fontweight='bold'
+        fontsize=12, fontweight='bold',
     )
-    
+
     for k in range(K):
-        ax = axes[k]
-        patch = tube[k, view_idx]  # [C, P, P]
-        img = tensor_to_image(patch, denorm=denorm)
-        
-        ax.imshow(img)
-        ax.axis('off')
-        ax.set_title(f"Scale {k}", fontsize=12)
-    
+        scale_label = f"{scales[k]}px" if k < len(scales) else f"s{k}"
+        patch_sp  = tube_sp[k, view_idx]   # [6, P, P]
+        patch_wav = tube_wav[k, view_idx]  # [3, P, P]
+
+        axes[k * 3 + 0].imshow(rgb_to_image(patch_sp[:3], denorm=denorm))
+        axes[k * 3 + 0].set_title(f"s{k} ({scale_label})\nRGB", fontsize=9)
+        axes[k * 3 + 0].axis('off')
+
+        axes[k * 3 + 1].imshow(residual_to_image(patch_sp[3:]))
+        axes[k * 3 + 1].set_title(f"s{k} ({scale_label})\nResidual", fontsize=9)
+        axes[k * 3 + 1].axis('off')
+
+        axes[k * 3 + 2].imshow(wavelet_to_image(patch_wav))
+        axes[k * 3 + 2].set_title(f"s{k} ({scale_label})\nWavelet", fontsize=9)
+        axes[k * 3 + 2].axis('off')
+
     plt.tight_layout()
-    
-    # Save in image subdirectory
-    image_dir = os.path.join(output_dir, f"image_{image_idx}")
-    Path(image_dir).mkdir(parents=True, exist_ok=True)
-    save_path = os.path.join(image_dir, f"scale_comparison_tube{tube_idx}_view{view_idx}.png")
+
+    image_dir = Path(output_dir) / f"image_{image_idx}"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    save_path = image_dir / f"scale_comparison_tube{tube_idx}_view{view_idx}.png"
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"Saved: {save_path}")
     plt.close()
 
 
-def plot_view_comparison(batch, image_idx=0, tube_idx=0, scale_idx=1, output_dir="visualizations", denorm=True):
+def plot_view_comparison(
+    batch,
+    image_idx=0,
+    tube_idx=0,
+    scale_idx=1,
+    output_dir="visualizations",
+    denorm=True,
+):
     """
-    Plot a comparison of all views for a single tube and scale.
-    
-    Args:
-        batch: batch dict from collator
-        image_idx: which image in the batch
-        tube_idx: which tube to visualize
-        scale_idx: which scale to visualize
-        output_dir: directory to save plots
-        denorm: whether to denormalize (should match collator's normalize setting)
+    For one (tube, scale), compare all views: RGB | Residual | Wavelet.
     """
-    tubes = batch['tubes']  # [B, N, K, V, C, P, P]
-    centers = batch['tube_centers']  # [B, N, 2]
-    labels = batch['labels']  # [B]
-    
-    B, N, K, V, C, P, _ = tubes.shape
-    
-    tube = tubes[image_idx, tube_idx]  # [K, V, C, P, P]
-    center = centers[image_idx, tube_idx]  # [2]
-    label = labels[image_idx].item()
-    
-    fig, axes = plt.subplots(1, V, figsize=(V * 4, 4))
-    if V == 1:
+    tubes   = batch['tubes']
+    wav     = batch['tubes_wavelet']
+    centers = batch['tube_centers']
+    labels  = batch['labels']
+
+    V = tubes.shape[3]
+
+    tube_sp  = tubes[image_idx, tube_idx]
+    tube_wav = wav[image_idx, tube_idx]
+    center   = centers[image_idx, tube_idx].tolist()
+    label    = labels[image_idx].item()
+
+    ncols = V * 3
+    fig, axes = plt.subplots(1, ncols, figsize=(ncols * 2.8, 3.5))
+    if ncols == 1:
         axes = [axes]
-    
+
     fig.suptitle(
-        f"View Comparison | Image {image_idx} | Tube {tube_idx} | Scale {scale_idx}\n"
-        f"Label: {'Synthetic' if label == 1 else 'Real'} | "
+        f"View comparison  |  Image {image_idx}  |  Tube {tube_idx}  |  Scale {scale_idx}\n"
+        f"Label: {'Synthetic' if label == 1 else 'Real'}  |  "
         f"Center: ({center[0]:.2f}, {center[1]:.2f})",
-        fontsize=14, fontweight='bold'
+        fontsize=12, fontweight='bold',
     )
-    
+
     for v in range(V):
-        ax = axes[v]
-        patch = tube[scale_idx, v]  # [C, P, P]
-        img = tensor_to_image(patch, denorm=denorm)
-        
-        ax.imshow(img)
-        ax.axis('off')
-        if v == 0:
-            ax.set_title(f"View {v}\n(original)", fontsize=12)
-        else:
-            ax.set_title(f"View {v}\n(augmented)", fontsize=12)
-    
+        patch_sp  = tube_sp[scale_idx, v]
+        patch_wav = tube_wav[scale_idx, v]
+        view_str  = "original" if v == 0 else f"augmented {v}"
+
+        axes[v * 3 + 0].imshow(rgb_to_image(patch_sp[:3], denorm=denorm))
+        axes[v * 3 + 0].set_title(f"v{v} ({view_str})\nRGB", fontsize=9)
+        axes[v * 3 + 0].axis('off')
+
+        axes[v * 3 + 1].imshow(residual_to_image(patch_sp[3:]))
+        axes[v * 3 + 1].set_title(f"v{v} ({view_str})\nResidual", fontsize=9)
+        axes[v * 3 + 1].axis('off')
+
+        axes[v * 3 + 2].imshow(wavelet_to_image(patch_wav))
+        axes[v * 3 + 2].set_title(f"v{v} ({view_str})\nWavelet", fontsize=9)
+        axes[v * 3 + 2].axis('off')
+
     plt.tight_layout()
-    
-    # Save in image subdirectory
-    image_dir = os.path.join(output_dir, f"image_{image_idx}")
-    Path(image_dir).mkdir(parents=True, exist_ok=True)
-    save_path = os.path.join(image_dir, f"view_comparison_tube{tube_idx}_scale{scale_idx}.png")
+
+    image_dir = Path(output_dir) / f"image_{image_idx}"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    save_path = image_dir / f"view_comparison_tube{tube_idx}_scale{scale_idx}.png"
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"Saved: {save_path}")
     plt.close()
 
 
-def plot_original_images_with_tube_centers(batch, num_samples=2, output_dir="visualizations", denorm=True):
+def plot_original_images_with_tube_centers(
+    batch,
+    num_samples=2,
+    output_dir="visualizations",
+):
     """
-    Plot original images with tube centers marked.
-    
-    This shows the full original images and marks where each tube was extracted from.
-    
-    Args:
-        batch: batch dict from collator (must contain 'image_paths')
-        num_samples: number of images to visualize
-        output_dir: directory to save plots
-        denorm: whether images were normalized (affects title, not used directly)
+    Plot original images with tube extraction regions overlaid.
     """
     image_paths = batch.get('image_paths', [])
-    centers = batch['tube_centers']  # [B, N, 2] - normalized coordinates (cy, cx)
-    labels = batch['labels']  # [B]
-    scales = batch.get('scales', [64, 128, 256])  # Get scales if available
-    
+    centers = batch['tube_centers']
+    labels  = batch['labels']
+    scales  = batch.get('scales', [64, 128, 256])
+
     if not image_paths:
-        print("⚠️  Warning: batch does not contain 'image_paths', cannot plot originals")
+        print("Warning: batch does not contain 'image_paths', skipping original image plot")
         return
-    
+
     B, N, _ = centers.shape
-    
-    print(f"\nPlotting original images with tube centers...")
-    
-    # Create output directory
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    
     num_samples = min(num_samples, B, len(image_paths))
-    
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    print(f"\nPlotting original images with tube centers...")
+
     for b in range(num_samples):
         img_path = image_paths[b]
-        label = labels[b].item()
-        
-        # Load original image
+        label    = labels[b].item()
+
         try:
-            img = Image.open(img_path).convert('RGB')
+            img       = Image.open(img_path).convert('RGB')
             img_array = np.array(img)
-            H, W = img_array.shape[:2]
+            H, W      = img_array.shape[:2]
         except Exception as e:
-            print(f"⚠️  Error loading {img_path}: {e}")
+            print(f"Error loading {img_path}: {e}")
             continue
-        
-        # Create figure
+
         fig, ax = plt.subplots(1, 1, figsize=(12, 12))
         ax.imshow(img_array)
-        
-        # Draw tube centers and extraction regions
-        tube_centers = centers[b]  # [N, 2]
-        
+
+        colors = ['red', 'orange', 'yellow']
         for tube_idx in range(N):
-            cy_norm, cx_norm = tube_centers[tube_idx].tolist()
-            
-            # Convert normalized coordinates to pixel coordinates
+            cy_norm, cx_norm = centers[b, tube_idx].tolist()
             cy = cy_norm * H
             cx = cx_norm * W
-            
-            # Draw a marker at the center
+
             ax.plot(cx, cy, 'r+', markersize=15, markeredgewidth=2)
-            
-            # Draw rectangles for each scale to show extraction region
-            # Use alpha to make them semi-transparent
-            colors = ['red', 'orange', 'yellow']
-            for scale_idx, scale in enumerate(scales[:3]):  # Show up to 3 scales
+
+            for si, scale in enumerate(scales[:3]):
                 half = scale / 2
-                # Rectangle: (x, y) is bottom-left corner
                 rect = mpatches.Rectangle(
-                    (cx - half, cy - half),  # bottom-left
-                    scale,  # width
-                    scale,  # height
-                    color=colors[scale_idx % len(colors)],
-                    fill=False, 
-                    linewidth=1.5, 
-                    alpha=0.6,
-                    linestyle='--'
+                    (cx - half, cy - half), scale, scale,
+                    color=colors[si % len(colors)],
+                    fill=False, linewidth=1.5, alpha=0.6, linestyle='--',
                 )
                 ax.add_patch(rect)
-            
-            # Add tube index label
+
             ax.text(
-                cx + 10, cy - 10, 
-                f'T{tube_idx}',
-                color='white',
-                fontsize=9,
-                fontweight='bold',
-                bbox=dict(boxstyle='round,pad=0.3', facecolor='red', alpha=0.7)
+                cx + 10, cy - 10, f'T{tube_idx}',
+                color='white', fontsize=9, fontweight='bold',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='red', alpha=0.7),
             )
-        
-        # Add title and legend
+
         ax.set_title(
-            f"Original Image {b} | Label: {'Synthetic' if label == 1 else 'Real'}\n"
-            f"Showing {N} tube extraction locations",
-            fontsize=14,
-            fontweight='bold'
+            f"Image {b}  |  Label: {'Synthetic' if label == 1 else 'Real'}\n"
+            f"{N} tube extraction locations",
+            fontsize=14, fontweight='bold',
         )
         ax.axis('off')
-        
-        # Create legend for scales
+
         legend_elements = [
-            mpatches.Patch(facecolor='red', alpha=0.6, label=f'Scale 0 ({scales[0]}px)'),
+            mpatches.Patch(facecolor=colors[i], alpha=0.6, label=f'Scale {i} ({scales[i]}px)')
+            for i in range(min(len(scales), 3))
         ]
-        if len(scales) > 1:
-            legend_elements.append(
-                mpatches.Patch(facecolor='orange', alpha=0.6, label=f'Scale 1 ({scales[1]}px)')
-            )
-        if len(scales) > 2:
-            legend_elements.append(
-                mpatches.Patch(facecolor='yellow', alpha=0.6, label=f'Scale 2 ({scales[2]}px)')
-            )
-        
         ax.legend(handles=legend_elements, loc='upper right', fontsize=10)
-        
+
         plt.tight_layout()
-        
-        # Save in image subdirectory
-        image_dir = os.path.join(output_dir, f"image_{b}")
-        Path(image_dir).mkdir(parents=True, exist_ok=True)
-        save_path = os.path.join(image_dir, f"original_with_tubes.png")
+
+        image_dir = Path(output_dir) / f"image_{b}"
+        image_dir.mkdir(parents=True, exist_ok=True)
+        save_path = image_dir / "original_with_tubes.png"
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         print(f"Saved: {save_path}")
         plt.close()
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
     parser = argparse.ArgumentParser(description="Visualize multi-scale tube batches")
-    
-    # Data arguments
-    parser.add_argument("--train_csv", type=str, required=True, help="Path to train CSV")
-    parser.add_argument("--root_dir", type=str, default="", help="Root directory for image paths")
-    parser.add_argument("--predict_model", action="store_true", help="Load model labels")
-    
-    # Tube configuration
-    parser.add_argument("--num_tubes", type=int, default=8, help="Number of tubes per image")
-    parser.add_argument("--scales", type=int, nargs="+", default=[64, 128, 256], help="Scales for multi-scale tubes")
-    parser.add_argument("--target_size", type=int, default=128, help="Target size for patches")
-    parser.add_argument("--num_views", type=int, default=2, help="Number of augmented views per patch")
-    
-    # Image size constraints
-    parser.add_argument("--min_image_size", type=int, default=256, help="Minimum image size (upscale if smaller)")
-    parser.add_argument("--max_image_size", type=int, default=2048, help="Maximum image size (downscale if larger)")
-    
-    # Visualization options
-    parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
-    parser.add_argument("--num_samples", type=int, default=2, help="Number of images to visualize")
-    parser.add_argument("--num_tubes_per_sample", type=int, default=4, help="Number of tubes to show per image")
-    parser.add_argument("--output_dir", type=str, default="visualizations", help="Output directory for plots")
-    parser.add_argument("--no-normalize", action="store_true", help="Disable normalization (for debugging)")
-    
+
+    parser.add_argument("--train_csv",   type=str, required=True)
+    parser.add_argument("--root_dir",    type=str, default="")
+    parser.add_argument("--predict_model", action="store_true")
+
+    parser.add_argument("--num_tubes",    type=int,          default=8)
+    parser.add_argument("--scales",       type=int, nargs="+", default=[64, 128, 256])
+    parser.add_argument("--target_size",  type=int,          default=128)
+    parser.add_argument("--num_views",    type=int,          default=2)
+    parser.add_argument("--min_image_size", type=int,        default=256)
+    parser.add_argument("--max_image_size", type=int,        default=2048)
+
+    parser.add_argument("--batch_size",          type=int, default=2)
+    parser.add_argument("--num_samples",         type=int, default=2)
+    parser.add_argument("--num_tubes_per_sample", type=int, default=4)
+    parser.add_argument("--output_dir",           type=str, default="visualizations")
+    parser.add_argument("--no-normalize",         action="store_true")
+
     args = parser.parse_args()
-    
-    # Determine if we should normalize
     use_normalize = not args.no_normalize
-    
+
     print(f"\n{'='*60}")
     print(f"MULTI-SCALE TUBE VISUALIZATION")
     print(f"{'='*60}\n")
-    
-    if not use_normalize:
-        print("⚠️  WARNING: Normalization is DISABLED (debug mode)")
-        print("   Images will not be normalized with ImageNet stats\n")
-    
-    # Create dataset
-    print("Loading dataset...")
-    print(f"CSV path: {args.train_csv}")
-    print(f"Root dir: '{args.root_dir}' (empty = paths relative to CWD)")
+
     dataset = MultiScaleTubeDataset(
         data_path=args.train_csv,
         predict_model=args.predict_model,
         root_dir=args.root_dir,
     )
     print(f"Dataset size: {len(dataset)}")
-    
-    # Create collator
-    print("Creating collator...")
+
     collator = MultiScaleTubeCollator(
         num_tubes=args.num_tubes,
         scales=args.scales,
@@ -493,83 +542,58 @@ def main():
         min_image_size=args.min_image_size,
         max_image_size=args.max_image_size,
     )
-    
-    # Create dataloader
-    print("Creating dataloader...")
+
     from torch.utils.data import DataLoader
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,  # Use 0 for reproducibility in visualization
+        num_workers=0,
         collate_fn=collator,
     )
-    
-    # Load a batch
+
     print("Loading batch...")
     batch = next(iter(dataloader))
-    
-    # Plot original images with tube centers
-    print("\nGenerating original image visualizations...")
+
+    # 1) Original images with tube regions
     plot_original_images_with_tube_centers(
-        batch,
-        num_samples=args.num_samples,
-        output_dir=args.output_dir,
-        denorm=use_normalize
+        batch, num_samples=args.num_samples, output_dir=args.output_dir,
     )
-    
-    # Plot summary
-    print("\nGenerating tube visualizations...")
+
+    # 2) Full representations (RGB | Residual | Wavelet) per tube
+    print("\nGenerating tube representations...")
     plot_batch_summary(
-        batch, 
+        batch,
         num_samples=args.num_samples,
         num_tubes_per_sample=args.num_tubes_per_sample,
         output_dir=args.output_dir,
-        denorm=use_normalize
+        denorm=use_normalize,
     )
-    
-    # Plot scale comparison
-    print("\nGenerating scale comparisons...")
+
+    # 3) Scale comparison for first image, first tube
+    print("\nGenerating scale comparison...")
     plot_scale_comparison(
-        batch, 
-        image_idx=0, 
-        tube_idx=0, 
-        view_idx=0, 
-        output_dir=args.output_dir,
-        denorm=use_normalize
+        batch, image_idx=0, tube_idx=0, view_idx=0,
+        output_dir=args.output_dir, denorm=use_normalize,
     )
-    
-    # Plot view comparison
-    print("\nGenerating view comparisons...")
+
+    # 4) View comparison for first image, first tube, middle scale
+    mid_scale = len(args.scales) // 2
+    print("\nGenerating view comparison...")
     plot_view_comparison(
-        batch, 
-        image_idx=0, 
-        tube_idx=0, 
-        scale_idx=1, 
-        output_dir=args.output_dir,
-        denorm=use_normalize
+        batch, image_idx=0, tube_idx=0, scale_idx=mid_scale,
+        output_dir=args.output_dir, denorm=use_normalize,
     )
-    
+
     print(f"\n{'='*60}")
-    print(f"✓ Visualizations saved to: {args.output_dir}/")
+    print(f"Visualizations saved to: {args.output_dir}/")
     print(f"{'='*60}\n")
-    
-    print("Directory structure created:")
+
     viz_dir = Path(args.output_dir)
-    
-    # List subdirectories (one per image)
-    image_dirs = sorted([d for d in viz_dir.iterdir() if d.is_dir() and d.name.startswith("image_")])
-    
-    if image_dirs:
-        for img_dir in image_dirs:
-            print(f"\n  📁 {img_dir.name}/")
-            files = sorted(img_dir.glob("*.png"))
-            for f in files:
-                print(f"     - {f.name}")
-    else:
-        # Fallback: list all PNG files (old behavior)
-        for f in sorted(viz_dir.glob("*.png")):
-            print(f"  - {f.name}")
+    for img_dir in sorted(d for d in viz_dir.iterdir() if d.is_dir() and d.name.startswith("image_")):
+        print(f"  {img_dir.name}/")
+        for f in sorted(img_dir.glob("*.png")):
+            print(f"    - {f.name}")
 
 
 if __name__ == "__main__":

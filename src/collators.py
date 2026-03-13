@@ -7,6 +7,7 @@ from typing import Tuple, List, Dict, Any
 import numpy as np
 import cv2
 import torch
+import torch.nn.functional as F
 import torchvision.transforms as T
 import torchvision.transforms.functional as TF
 from PIL import Image
@@ -390,21 +391,20 @@ class ValFullImagePatchCollator:
 class MultiScaleTubeCollator:
     """
     Collator for multi-scale tube contrastive learning.
-    
+
     For each image:
       1) Selects N tube centers (spatial locations)
       2) For each center, extracts K patches at different scales (multi-scale tube)
-      3) For each patch in the tube, creates V augmented views with controlled degradations
-      
-    The intuition:
-      - Same spatial location, different scales → scale invariance
-      - Augmented views → robustness to degradations while preserving forensic traces
-      
-    Returns:
-      - tubes: [B, N_tubes, K_scales, V_views, C, P, P]
-      - tube_centers: [B, N_tubes, 2] - normalized (cy, cx)
-      - labels: [B]
-      - model_labels: [B] (optional)
+      3) For each patch produces V augmented views and computes two representations:
+           - Spatial  : RGB (ImageNet-norm) + high-freq residual  →  6 channels
+           - Wavelet  : Haar DWT LH/HL/HH bands (luminance)       →  3 channels
+
+    Output tensors:
+      - tubes:         [B, N_tubes, K_scales, V_views, 6, P, P]  (spatial / residual branch)
+      - tubes_wavelet: [B, N_tubes, K_scales, V_views, 3, P, P]  (frequency branch)
+      - tube_centers:  [B, N_tubes, 2]  - normalized (cy, cx) in [0, 1]
+      - labels:        [B]
+      - model_labels:  [B] (optional)
     """
     
     def __init__(
@@ -452,7 +452,15 @@ class MultiScaleTubeCollator:
         
         self.to_tensor = T.ToTensor()
         self.normalize = T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD) if normalize else None
-    
+
+        # Haar wavelet kernels for DWT level-1 (no external dependency)
+        # Row filters: [1, 1]/2 (low-pass), [1, -1]/2 (high-pass), shape [1, 1, 1, 2]
+        self._haar_row_lo = torch.tensor([[[[1., 1.]]]], dtype=torch.float32) / 2
+        self._haar_row_hi = torch.tensor([[[[1., -1.]]]], dtype=torch.float32) / 2
+        # Col filters: shape [1, 1, 2, 1]
+        self._haar_col_lo = torch.tensor([[[[1.], [1.]]]], dtype=torch.float32) / 2
+        self._haar_col_hi = torch.tensor([[[[1.], [-1.]]]], dtype=torch.float32) / 2
+
     def _apply_degradations(self, img: Image.Image) -> Image.Image:
         """
         Apply a single random degradation to create a view.
@@ -514,7 +522,69 @@ class MultiScaleTubeCollator:
             img = TF.to_pil_image(noisy_t)
         
         return img
-    
+
+    def _compute_residual(self, patch_t: torch.Tensor) -> torch.Tensor:
+        """
+        High-frequency residual: r = patch - gaussian_blur(patch).
+
+        Input:  patch_t [3, P, P] float in [0, 1]
+        Output: [3, P, P] zero-centered float
+        """
+        pil = TF.to_pil_image(patch_t)
+        blurred = TF.gaussian_blur(pil, kernel_size=5, sigma=1.0)
+        return patch_t - self.to_tensor(blurred)
+
+    def _haar_dwt2(self, gray: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Level-1 Haar DWT on a single-channel tensor.
+
+        Input:  gray [1, P, P] float
+        Output: (LH, HL, HH) each [1, P//2, P//2]
+            LH = horizontal edges  (row low × col high)
+            HL = vertical edges    (row high × col low)
+            HH = diagonal details  (row high × col high)
+        """
+        x = gray.unsqueeze(0)  # [1, 1, P, P]
+
+        # Row-wise filtering (stride along width)
+        row_lo = F.conv2d(x, self._haar_row_lo, stride=(1, 2))  # [1, 1, P, P//2]
+        row_hi = F.conv2d(x, self._haar_row_hi, stride=(1, 2))  # [1, 1, P, P//2]
+
+        # Column-wise filtering (stride along height)
+        LH = F.conv2d(row_lo, self._haar_col_hi, stride=(2, 1)).squeeze(0)  # [1, P//2, P//2]
+        HL = F.conv2d(row_hi, self._haar_col_lo, stride=(2, 1)).squeeze(0)  # [1, P//2, P//2]
+        HH = F.conv2d(row_hi, self._haar_col_hi, stride=(2, 1)).squeeze(0)  # [1, P//2, P//2]
+
+        return LH, HL, HH
+
+    def _compute_wavelet(self, patch_t: torch.Tensor) -> torch.Tensor:
+        """
+        Haar DWT level-1 on the luminance channel; returns the 3 high-freq
+        sub-bands (LH, HL, HH) stacked as a 3-channel tensor.
+
+        Input:  patch_t [3, P, P] float in [0, 1]
+        Output: [3, P, P] float (per-band normalized, resized from P//2)
+        """
+        # Luminance
+        gray = (0.2989 * patch_t[0] + 0.5870 * patch_t[1] + 0.1140 * patch_t[2]).unsqueeze(0)
+
+        LH, HL, HH = self._haar_dwt2(gray)   # each [1, P//2, P//2]
+        bands = torch.cat([LH, HL, HH], dim=0)  # [3, P//2, P//2]
+
+        # Normalize to unit variance, clamp outliers
+        bands = bands / (bands.std() + 1e-8)
+        bands = torch.clamp(bands, -3.0, 3.0)
+
+        # Resize to target_size (bilinear)
+        bands = F.interpolate(
+            bands.unsqueeze(0),
+            size=(self.target_size, self.target_size),
+            mode='bilinear',
+            align_corners=False,
+        ).squeeze(0)  # [3, P, P]
+
+        return bands
+
     def _extract_tube(self, img: Image.Image, center_y: float, center_x: float) -> List[torch.Tensor]:
         """
         Extract patches at multiple scales centered at (center_y, center_x).
@@ -677,121 +747,108 @@ class MultiScaleTubeCollator:
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
         Process a batch of images into multi-scale tubes with views.
-        
+
+        Each patch produces two representations:
+          - Spatial branch : RGB (ImageNet-normalized) + high-freq residual → 6 channels
+          - Wavelet branch  : Haar DWT LH/HL/HH bands (luminance)          → 3 channels
+
         Args:
             batch: List of dicts with keys: "image", "label", ["model_label"]
-            
+
         Returns:
             Dict with:
-                - tubes: [B, N_tubes, K_scales, V_views, C, P, P]
-                - tube_centers: [B, N_tubes, 2]
-                - labels: [B]
-                - model_labels: [B] (optional)
+                - tubes:         [B, N_tubes, K_scales, V_views, 6, P, P]
+                - tubes_wavelet: [B, N_tubes, K_scales, V_views, 3, P, P]
+                - tube_centers:  [B, N_tubes, 2]
+                - labels:        [B]
+                - model_labels:  [B] (optional)
         """
-        B = len(batch)
-        K = len(self.scales)
         V = self.num_views
-        N = self.num_tubes
-        C = 3
-        P = self.target_size
-        
-        tubes_list = []
+
+        tubes_spatial_list = []   # [N, K, V, 6, P, P] per image
+        tubes_wavelet_list = []   # [N, K, V, 3, P, P] per image
         centers_list = []
         labels = []
         model_labels = []
         image_paths = []
-        
+
         for item in batch:
             img = item["image"]
             label = item["label"]
-            
+
             if "model_label" in item:
                 model_labels.append(item["model_label"])
-            
-            # Store absolute path for visualization
+
             if "abs_path" in item:
                 image_paths.append(item["abs_path"])
-            
+
             # Ensure PIL Image
             if isinstance(img, torch.Tensor):
                 img = TF.to_pil_image(img)
-            
+
             # Resize image if outside acceptable range
             w, h = img.size
-            
-            # Too small: upscale to minimum
             if min(w, h) < self.min_image_size:
                 scale_factor = self.min_image_size / min(w, h)
-                new_w, new_h = int(w * scale_factor), int(h * scale_factor)
-                img = TF.resize(img, (new_h, new_w))
-            
-            # Too large: downscale to maximum
+                img = TF.resize(img, (int(h * scale_factor), int(w * scale_factor)))
             elif max(w, h) > self.max_image_size:
                 scale_factor = self.max_image_size / max(w, h)
-                new_w, new_h = int(w * scale_factor), int(h * scale_factor)
-                img = TF.resize(img, (new_h, new_w))
-            
-            # Sample tube centers
+                img = TF.resize(img, (int(h * scale_factor), int(w * scale_factor)))
+
             centers = self._sample_tube_centers(img)
             centers_list.append(centers)
-            
-            # For each tube center
-            img_tubes = []
+
+            img_tubes_spatial = []  # [N, K, V, 6, P, P]
+            img_tubes_wavelet = []  # [N, K, V, 3, P, P]
+
             for cy, cx in centers:
-                # Extract multi-scale patches (no augmentation yet)
-                scale_patches = self._extract_tube(img, cy, cx)
-                
-                # For each scale, create V augmented views
-                tube_views = []
-                for scale_t in scale_patches:
-                    views = []
-                    
-                    # First view: original (or lightly augmented)
-                    view0 = scale_t
-                    if self.normalize is not None:
-                        view0 = self.normalize(view0)
-                    views.append(view0)
-                    
-                    # Additional views: apply degradations
+                scale_patches = self._extract_tube(img, cy, cx)  # list of K [3, P, P]
+
+                tube_spatial = []  # [K, V, 6, P, P]
+                tube_wavelet = []  # [K, V, 3, P, P]
+
+                for scale_t in scale_patches:  # scale_t: [3, P, P], raw float [0,1]
+                    spatial_views = []
+                    wavelet_views = []
+
+                    # View 0: no augmentation
+                    res_t = self._compute_residual(scale_t)
+                    wav_t = self._compute_wavelet(scale_t)
+                    rgb_norm = self.normalize(scale_t) if self.normalize else scale_t
+                    spatial_views.append(torch.cat([rgb_norm, res_t], dim=0))  # [6, P, P]
+                    wavelet_views.append(wav_t)
+
+                    # Views 1..V-1: augmented
                     for _ in range(V - 1):
-                        # Convert tensor back to PIL for degradation
-                        pil_patch = TF.to_pil_image(scale_t)
-                        aug_patch = self._apply_degradations(pil_patch)
-                        aug_t = self.to_tensor(aug_patch)
-                        if self.normalize is not None:
-                            aug_t = self.normalize(aug_t)
-                        views.append(aug_t)
-                    
-                    # Stack views: [V, C, P, P]
-                    tube_views.append(torch.stack(views, dim=0))
-                
-                # Stack scales: [K, V, C, P, P]
-                img_tubes.append(torch.stack(tube_views, dim=0))
-            
-            # Stack tubes: [N, K, V, C, P, P]
-            tubes_list.append(torch.stack(img_tubes, dim=0))
+                        aug_t = self.to_tensor(self._apply_degradations(TF.to_pil_image(scale_t)))
+                        res_aug = self._compute_residual(aug_t)
+                        wav_aug = self._compute_wavelet(aug_t)
+                        rgb_norm_aug = self.normalize(aug_t) if self.normalize else aug_t
+                        spatial_views.append(torch.cat([rgb_norm_aug, res_aug], dim=0))  # [6, P, P]
+                        wavelet_views.append(wav_aug)
+
+                    tube_spatial.append(torch.stack(spatial_views, dim=0))  # [V, 6, P, P]
+                    tube_wavelet.append(torch.stack(wavelet_views, dim=0))  # [V, 3, P, P]
+
+                img_tubes_spatial.append(torch.stack(tube_spatial, dim=0))  # [K, V, 6, P, P]
+                img_tubes_wavelet.append(torch.stack(tube_wavelet, dim=0))  # [K, V, 3, P, P]
+
+            tubes_spatial_list.append(torch.stack(img_tubes_spatial, dim=0))  # [N, K, V, 6, P, P]
+            tubes_wavelet_list.append(torch.stack(img_tubes_wavelet, dim=0))  # [N, K, V, 3, P, P]
             labels.append(label)
-        
-        # Stack batch: [B, N, K, V, C, P, P]
-        tubes = torch.stack(tubes_list, dim=0)
-        
-        # Convert centers to tensor: [B, N, 2]
-        centers_tensor = torch.tensor(centers_list, dtype=torch.float32)
-        
-        # Convert labels
-        labels = torch.tensor(labels, dtype=torch.long)
-        
+
         output = {
-            "tubes": tubes,  # [B, N_tubes, K_scales, V_views, C, P, P]
-            "tube_centers": centers_tensor,  # [B, N_tubes, 2]
-            "labels": labels,  # [B]
-            "scales": self.scales,  # List of scale values for reference
+            "tubes":         torch.stack(tubes_spatial_list, dim=0),  # [B, N, K, V, 6, P, P]
+            "tubes_wavelet": torch.stack(tubes_wavelet_list, dim=0),  # [B, N, K, V, 3, P, P]
+            "tube_centers":  torch.tensor(centers_list, dtype=torch.float32),  # [B, N, 2]
+            "labels":        torch.tensor(labels, dtype=torch.long),           # [B]
+            "scales":        self.scales,
         }
-        
+
         if model_labels:
             output["model_labels"] = torch.tensor(model_labels, dtype=torch.long)
-        
+
         if image_paths:
             output["image_paths"] = image_paths
-        
+
         return output
