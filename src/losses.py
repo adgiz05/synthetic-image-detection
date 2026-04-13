@@ -226,7 +226,9 @@ def decoupling_loss(
     """
     Penalise linear correlation between z_auth and z_src:
 
-        L_decouple = ‖ C ‖²_F,   C_ij = corr(z_auth_col_i, z_src_col_j)
+        L_decouple = ‖ C ‖²_F / (D_auth × D_src),   C_ij = corr(z_auth_col_i, z_src_col_j)
+
+    Normalized by dimensionality for scale-invariance across architectures.
 
     Args:
         z_auth: [M, D_auth]
@@ -242,7 +244,10 @@ def decoupling_loss(
     z_s = (z_src  - z_src.mean(0))  / (z_src.std(0)  + 1e-8)  # [M, D_src]
 
     C = (z_a.T @ z_s) / M   # [D_auth, D_src]  empirical cross-correlation
-    return (C ** 2).sum()
+
+    # Frobenius norm squared, normalized by dimensionality
+    D_auth, D_src = z_a.shape[1], z_s.shape[1]
+    return (C ** 2).sum() / (D_auth * D_src)
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +275,7 @@ class Phase1Loss(nn.Module):
         self,
         lambda_auth: float = 1.0,
         lambda_src: float = 0.5,
-        lambda_decouple: float = 0.1,
+        lambda_decouple: float = 0.01,
         w_view: float = 1.0,
         w_scale: float = 0.8,
         w_tube: float = 0.3,
@@ -297,6 +302,7 @@ class Phase1Loss(nn.Module):
         N: int,
         K: int,
         V: int,
+        tube_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
@@ -305,6 +311,7 @@ class Phase1Loss(nn.Module):
             auth_labels:  [B]  0=real, 1=synthetic
             model_labels: [B]  generator ID, or None (src loss skipped if None)
             B, N, K, V:   batch dimensions (must match z_auth.shape[:4])
+            tube_mask:    [B, N] bool mask (True=valid, False=padding), or None (all valid)
 
         Returns:
             Dict:
@@ -313,40 +320,89 @@ class Phase1Loss(nn.Module):
                 loss_src       — L_supcon_src  (0 if no synthetic / no model_labels)
                 loss_decouple  — L_decouple
         """
+        device = z_auth.device
+        dtype = z_auth.dtype
+
+        # Build index tensors [M] for vectorized operations
+        # Order: batch → tube → scale → view (row-major flattening)
         M = B * N * K * V
+        b_idx = torch.arange(B, device=device).view(B, 1, 1, 1).expand(B, N, K, V).reshape(M)
+        n_idx = torch.arange(N, device=device).view(1, N, 1, 1).expand(B, N, K, V).reshape(M)
+        k_idx = torch.arange(K, device=device).view(1, 1, K, 1).expand(B, N, K, V).reshape(M)
+        v_idx = torch.arange(V, device=device).view(1, 1, 1, V).expand(B, N, K, V).reshape(M)
 
-        # Flatten and re-normalise (mean of unit vectors ≠ unit vector)
-        z_a = F.normalize(z_auth.reshape(M, -1), dim=-1)  # [M, D_auth]
-        z_s = F.normalize(z_src.reshape(M, -1),  dim=-1)  # [M, D_src]
+        # Flatten embeddings
+        z_a = F.normalize(z_auth.reshape(M, -1), dim=-1)  # [M, D]
+        z_s = F.normalize(z_src.reshape(M, -1), dim=-1)   # [M, D]
 
-        # ── Auth SupCon ──────────────────────────────────────────────────────
-        l_auth = supcon_auth_loss(
-            z_a, B, N, K, V,
-            self.w_view, self.w_scale, self.w_tube,
-            self.temp_auth,
-        )
+        # Handle tube masking if provided
+        if tube_mask is not None:
+            # Expand mask [B, N] -> [B, N, K, V] -> [M]
+            mask = tube_mask.view(B, N, 1, 1).expand(B, N, K, V).reshape(M)
+            z_a = z_a[mask]
+            z_s = z_s[mask]
+            b_idx = b_idx[mask]
+            n_idx = n_idx[mask]
+            k_idx = k_idx[mask]
+            v_idx = v_idx[mask]
+            M = mask.sum().item()
 
-        # ── Src SupCon (skip if model_labels not available) ──────────────────
+        # ── Build weight matrix for auth SupCon (vectorized) ────────────────
+        # same_* are [M, M] boolean matrices
+        same_b = (b_idx.unsqueeze(1) == b_idx.unsqueeze(0))  # [M, M]
+        same_n = (n_idx.unsqueeze(1) == n_idx.unsqueeze(0))  # [M, M]
+        same_k = (k_idx.unsqueeze(1) == k_idx.unsqueeze(0))  # [M, M]
+        same_v = (v_idx.unsqueeze(1) == v_idx.unsqueeze(0))  # [M, M]
+
+        # Diagonal mask (exclude self)
+        not_self = ~torch.eye(M, dtype=torch.bool, device=device)
+
+        # Hierarchical positive weights:
+        # w_view:  same_b & same_n & same_k & ~same_v (same patch, different view)
+        # w_scale: same_b & same_n & ~same_k         (same tube, different scale)
+        # w_tube:  same_b & ~same_n                  (same image, different tube)
+        pos_weights = torch.zeros(M, M, device=device, dtype=dtype)
+        pos_weights += self.w_view  * (same_b & same_n & same_k & ~same_v & not_self).float()
+        pos_weights += self.w_scale * (same_b & same_n & ~same_k & not_self).float()
+        pos_weights += self.w_tube  * (same_b & ~same_n & not_self).float()
+
+        l_auth = weighted_supcon(z_a, pos_weights, self.temp_auth)
+
+        # ── Source SupCon (vectorized) ──────────────────────────────────────
         if model_labels is not None:
-            l_src = supcon_src_loss(
-                z_s, auth_labels, model_labels,
-                B, N, K, V, self.temp_src,
-            )
-        else:
-            l_src = z_a.new_zeros(1).squeeze()
+            auth_expanded = auth_labels[b_idx]     # [M]
+            model_expanded = model_labels[b_idx]   # [M]
+            syn_mask = (auth_expanded == 1)
 
-        # ── Decoupling ───────────────────────────────────────────────────────
+            if syn_mask.sum() > 1:
+                z_s_syn = z_s[syn_mask]
+                model_syn = model_expanded[syn_mask]
+                M_syn = syn_mask.sum().item()
+
+                # Positive pairs: same generator (vectorized)
+                same_model = (model_syn.unsqueeze(1) == model_syn.unsqueeze(0))  # [M_syn, M_syn]
+                not_self_syn = ~torch.eye(M_syn, dtype=torch.bool, device=device)
+                pos_weights_src = (same_model & not_self_syn).float()
+
+                l_src = weighted_supcon(z_s_syn, pos_weights_src, self.temp_src)
+            else:
+                l_src = torch.tensor(0.0, device=device, dtype=dtype)
+        else:
+            l_src = torch.tensor(0.0, device=device, dtype=dtype)
+
+        # ── Decoupling ──────────────────────────────────────────────────────
         l_decouple = decoupling_loss(z_a, z_s)
 
-        total = (
-            self.lambda_auth     * l_auth
-            + self.lambda_src    * l_src
-            + self.lambda_decouple * l_decouple
+        # ── Combine ─────────────────────────────────────────────────────────
+        loss = (
+            self.lambda_auth     * l_auth +
+            self.lambda_src      * l_src +
+            self.lambda_decouple * l_decouple
         )
 
         return {
-            "loss":          total,
-            "loss_auth":     l_auth,
-            "loss_src":      l_src,
-            "loss_decouple": l_decouple,
+            "loss":           loss,
+            "loss_auth":      l_auth,
+            "loss_src":       l_src,
+            "loss_decouple":  l_decouple,
         }

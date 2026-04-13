@@ -405,15 +405,21 @@ class MultiScaleTubeCollator:
       - tube_centers:  [B, N_tubes, 2]  - normalized (cy, cx) in [0, 1]
       - labels:        [B]
       - model_labels:  [B] (optional)
+
+    NOTE: For faster training, consider using FastMultiScaleTubeCollator which
+    defers residual/wavelet computation to GPU.
     """
-    
+
     def __init__(
         self,
         # Tube configuration
-        num_tubes: int = 8,
+        max_tubes: int = 16,          # Maximum tubes per image (adaptive)
         scales: List[int] = [64, 128, 256],
         target_size: int = 128,
         num_views: int = 2,
+        # Adaptive coverage params
+        min_tubes: int = 4,           # Minimum tubes even for small images
+        overlap_ratio: float = 0.25,  # Target overlap between adjacent tubes (0=no overlap, 0.5=half overlap)
         # Degradation params for views
         jpeg_prob: float = 0.5,
         jpeg_quality_range: Tuple[int, int] = (70, 95),
@@ -430,7 +436,9 @@ class MultiScaleTubeCollator:
         min_image_size: int = 256,  # minimum size to extract largest scale
         max_image_size: int = 2048,  # maximum size - resize if exceeded
     ):
-        self.num_tubes = num_tubes
+        self.max_tubes = max_tubes
+        self.min_tubes = min_tubes
+        self.overlap_ratio = overlap_ratio
         self.scales = sorted(scales)  # [small -> large]
         self.target_size = target_size
         self.num_views = num_views
@@ -666,36 +674,71 @@ class MultiScaleTubeCollator:
         info_map = info_map * 0.9 + 0.1
         
         return info_map
-    
-    def _sample_tube_centers(self, img: Image.Image) -> List[Tuple[float, float]]:
+
+    def _calculate_optimal_num_tubes(self, img_w: int, img_h: int) -> int:
+        """
+        Calculate the optimal number of tubes to cover the image with minimal overlap.
+
+        Strategy:
+        - Based on the largest scale (most restrictive)
+        - Use overlap_ratio to determine stride (e.g. 0.25 → stride = 0.75 * scale)
+        - Calculate grid dimensions
+        - Clamp to [min_tubes, max_tubes]
+
+        Args:
+            img_w: image width (px)
+            img_h: image height (px)
+
+        Returns:
+            optimal number of tubes for this image
+        """
+        largest_scale = self.scales[-1]
+
+        # Calculate stride to achieve target overlap
+        stride = int(largest_scale * (1.0 - self.overlap_ratio))
+        stride = max(stride, largest_scale // 2)  # At least 50% coverage
+
+        # How many tubes fit in each dimension?
+        nx = max(1, (img_w - largest_scale) // stride + 1)
+        ny = max(1, (img_h - largest_scale) // stride + 1)
+        total_possible = nx * ny
+
+        # Clamp to [min_tubes, max_tubes]
+        return max(self.min_tubes, min(total_possible, self.max_tubes))
+
+    def _sample_tube_centers(self, img: Image.Image, num_tubes: int) -> List[Tuple[float, float]]:
         """
         Sample N tube centers from the image with:
         1. Priority to information-rich regions
         2. Overlap control via minimum distance
-        
+
+        Args:
+            img: PIL Image
+            num_tubes: number of tubes to sample for this image
+
         Returns:
             List of (cy, cx) in normalized coordinates [0, 1]
         """
         w, h = img.size
         max_scale = self.scales[-1]
-        
+
         # Define valid region (avoid edges where largest scale won't fit)
         margin_y = max_scale / (2 * h)
         margin_x = max_scale / (2 * w)
-        
+
         # Compute information map
         info_map = self._compute_information_map(img, downsample_factor=4)
         info_h, info_w = info_map.shape
-        
+
         # Minimum distance between centers (in normalized coords)
         # Set to ~1.5x the largest scale to reduce overlap
         min_distance = 1.5 * max_scale / max(h, w)
-        
+
         centers = []
-        max_attempts = self.num_tubes * 20  # avoid infinite loop
+        max_attempts = num_tubes * 20  # avoid infinite loop
         attempts = 0
-        
-        while len(centers) < self.num_tubes and attempts < max_attempts:
+
+        while len(centers) < num_tubes and attempts < max_attempts:
             attempts += 1
             
             # Sample from information map using weighted probability
@@ -737,16 +780,19 @@ class MultiScaleTubeCollator:
                 info_map[iy_min:iy_max, ix_min:ix_max] *= 0.1
         
         # If we couldn't get enough centers with constraints, fill with random
-        while len(centers) < self.num_tubes:
+        while len(centers) < num_tubes:
             cy = random.uniform(margin_y, 1 - margin_y)
             cx = random.uniform(margin_x, 1 - margin_x)
             centers.append((cy, cx))
-        
+
         return centers
     
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
         Process a batch of images into multi-scale tubes with views.
+
+        Adaptive tube sampling: each image gets a variable number of tubes [min_tubes, max_tubes]
+        based on image size, then padded to max_tubes for batching.
 
         Each patch produces two representations:
           - Spatial branch : RGB (ImageNet-normalized) + high-freq residual → 6 channels
@@ -757,22 +803,29 @@ class MultiScaleTubeCollator:
 
         Returns:
             Dict with:
-                - tubes:         [B, N_tubes, K_scales, V_views, 6, P, P]
-                - tubes_wavelet: [B, N_tubes, K_scales, V_views, 3, P, P]
-                - tube_centers:  [B, N_tubes, 2]
+                - tubes:         [B, max_tubes, K_scales, V_views, 6, P, P]
+                - tubes_wavelet: [B, max_tubes, K_scales, V_views, 3, P, P]
+                - tube_centers:  [B, max_tubes, 2]
+                - tube_mask:     [B, max_tubes]  (True = valid tube, False = padding)
                 - labels:        [B]
                 - model_labels:  [B] (optional)
         """
+        B = len(batch)
+        K = len(self.scales)
         V = self.num_views
+        P = self.target_size
 
-        tubes_spatial_list = []   # [N, K, V, 6, P, P] per image
-        tubes_wavelet_list = []   # [N, K, V, 3, P, P] per image
-        centers_list = []
+        # Pre-allocate padded tensors
+        tubes_spatial = torch.zeros(B, self.max_tubes, K, V, 6, P, P)
+        tubes_wavelet = torch.zeros(B, self.max_tubes, K, V, 3, P, P)
+        tube_centers  = torch.zeros(B, self.max_tubes, 2)
+        tube_mask     = torch.zeros(B, self.max_tubes, dtype=torch.bool)
         labels = []
         model_labels = []
         image_paths = []
+        benchmarks = []
 
-        for item in batch:
+        for b, item in enumerate(batch):
             img = item["image"]
             label = item["label"]
 
@@ -781,6 +834,9 @@ class MultiScaleTubeCollator:
 
             if "abs_path" in item:
                 image_paths.append(item["abs_path"])
+
+            if "benchmark" in item:
+                benchmarks.append(item["benchmark"])
 
             # Ensure PIL Image
             if isinstance(img, torch.Tensor):
@@ -791,58 +847,51 @@ class MultiScaleTubeCollator:
             if min(w, h) < self.min_image_size:
                 scale_factor = self.min_image_size / min(w, h)
                 img = TF.resize(img, (int(h * scale_factor), int(w * scale_factor)))
+                w, h = img.size
             elif max(w, h) > self.max_image_size:
                 scale_factor = self.max_image_size / max(w, h)
                 img = TF.resize(img, (int(h * scale_factor), int(w * scale_factor)))
+                w, h = img.size
 
-            centers = self._sample_tube_centers(img)
-            centers_list.append(centers)
+            # Adaptive tube count for this image
+            num_tubes_i = self._calculate_optimal_num_tubes(w, h)
+            centers = self._sample_tube_centers(img, num_tubes_i)
 
-            img_tubes_spatial = []  # [N, K, V, 6, P, P]
-            img_tubes_wavelet = []  # [N, K, V, 3, P, P]
+            # Store centers and mask
+            for n in range(num_tubes_i):
+                tube_centers[b, n, 0] = centers[n][0]  # cy
+                tube_centers[b, n, 1] = centers[n][1]  # cx
+                tube_mask[b, n] = True
 
-            for cy, cx in centers:
+            # Extract tubes
+            for n, (cy, cx) in enumerate(centers):
                 scale_patches = self._extract_tube(img, cy, cx)  # list of K [3, P, P]
 
-                tube_spatial = []  # [K, V, 6, P, P]
-                tube_wavelet = []  # [K, V, 3, P, P]
-
-                for scale_t in scale_patches:  # scale_t: [3, P, P], raw float [0,1]
-                    spatial_views = []
-                    wavelet_views = []
-
+                for k, scale_t in enumerate(scale_patches):  # scale_t: [3, P, P]
                     # View 0: no augmentation
                     res_t = self._compute_residual(scale_t)
                     wav_t = self._compute_wavelet(scale_t)
                     rgb_norm = self.normalize(scale_t) if self.normalize else scale_t
-                    spatial_views.append(torch.cat([rgb_norm, res_t], dim=0))  # [6, P, P]
-                    wavelet_views.append(wav_t)
+                    tubes_spatial[b, n, k, 0] = torch.cat([rgb_norm, res_t], dim=0)  # [6, P, P]
+                    tubes_wavelet[b, n, k, 0] = wav_t
 
                     # Views 1..V-1: augmented
-                    for _ in range(V - 1):
+                    for v in range(1, V):
                         aug_t = self.to_tensor(self._apply_degradations(TF.to_pil_image(scale_t)))
                         res_aug = self._compute_residual(aug_t)
                         wav_aug = self._compute_wavelet(aug_t)
                         rgb_norm_aug = self.normalize(aug_t) if self.normalize else aug_t
-                        spatial_views.append(torch.cat([rgb_norm_aug, res_aug], dim=0))  # [6, P, P]
-                        wavelet_views.append(wav_aug)
+                        tubes_spatial[b, n, k, v] = torch.cat([rgb_norm_aug, res_aug], dim=0)  # [6, P, P]
+                        tubes_wavelet[b, n, k, v] = wav_aug
 
-                    tube_spatial.append(torch.stack(spatial_views, dim=0))  # [V, 6, P, P]
-                    tube_wavelet.append(torch.stack(wavelet_views, dim=0))  # [V, 3, P, P]
-
-                img_tubes_spatial.append(torch.stack(tube_spatial, dim=0))  # [K, V, 6, P, P]
-                img_tubes_wavelet.append(torch.stack(tube_wavelet, dim=0))  # [K, V, 3, P, P]
-
-            tubes_spatial_list.append(torch.stack(img_tubes_spatial, dim=0))  # [N, K, V, 6, P, P]
-            tubes_wavelet_list.append(torch.stack(img_tubes_wavelet, dim=0))  # [N, K, V, 3, P, P]
             labels.append(label)
 
         output = {
-            "tubes":         torch.stack(tubes_spatial_list, dim=0),  # [B, N, K, V, 6, P, P]
-            "tubes_wavelet": torch.stack(tubes_wavelet_list, dim=0),  # [B, N, K, V, 3, P, P]
-            "tube_centers":  torch.tensor(centers_list, dtype=torch.float32),  # [B, N, 2]
-            "labels":        torch.tensor(labels, dtype=torch.long),           # [B]
-            "scales":        self.scales,
+            "tubes":         tubes_spatial,  # [B, max_tubes, K, V, 6, P, P]
+            "tubes_wavelet": tubes_wavelet,  # [B, max_tubes, K, V, 3, P, P]
+            "tube_centers":  tube_centers,   # [B, max_tubes, 2]
+            "tube_mask":     tube_mask,      # [B, max_tubes]
+            "labels":        torch.tensor(labels, dtype=torch.long),  # [B]
         }
 
         if model_labels:
@@ -850,5 +899,322 @@ class MultiScaleTubeCollator:
 
         if image_paths:
             output["image_paths"] = image_paths
+
+        if benchmarks:
+            output["benchmarks"] = benchmarks
+
+        return output
+
+
+class FastMultiScaleTubeCollator:
+    """
+    Optimized collator for multi-scale tube contrastive learning.
+
+    Key optimizations vs MultiScaleTubeCollator:
+    - Returns RGB-only tubes (residual/wavelet computed on GPU)
+    - No PIL BytesIO for JPEG (uses fast tensor augmentations)
+    - Batch-vectorized tube extraction where possible
+
+    Output tensors:
+      - tubes_rgb:     [B, N_tubes, K_scales, V_views, 3, P, P]  RGB in [0,1] (NOT normalized)
+      - tube_centers:  [B, N_tubes, 2]  - normalized (cy, cx) in [0, 1]
+      - tube_mask:     [B, N_tubes]  - boolean mask for valid tubes
+      - labels:        [B]
+      - model_labels:  [B] (optional)
+
+    The model is responsible for:
+      1) Computing residual and wavelet on GPU (GPUPreprocessor)
+      2) Applying ImageNet normalization
+      3) Constructing 6-channel spatial input
+    """
+
+    def __init__(
+        self,
+        # Tube configuration
+        max_tubes: int = 16,
+        scales: List[int] = [64, 128, 256],
+        target_size: int = 128,
+        num_views: int = 2,
+        # Adaptive coverage params
+        min_tubes: int = 4,
+        overlap_ratio: float = 0.25,
+        # Fast augmentation params (tensor-based, no PIL)
+        blur_prob: float = 0.3,
+        blur_sigma_range: Tuple[float, float] = (0.5, 2.0),
+        noise_prob: float = 0.3,
+        noise_std_range: Tuple[float, float] = (0.01, 0.05),
+        downsample_prob: float = 0.3,
+        downsample_range: Tuple[float, float] = (0.5, 0.9),
+        # Options
+        min_image_size: int = 256,
+        max_image_size: int = 2048,
+    ):
+        self.max_tubes = max_tubes
+        self.min_tubes = min_tubes
+        self.overlap_ratio = overlap_ratio
+        self.scales = sorted(scales)
+        self.target_size = target_size
+        self.num_views = num_views
+
+        # Augmentation params
+        self.blur_prob = blur_prob
+        self.blur_sigma_range = blur_sigma_range
+        self.noise_prob = noise_prob
+        self.noise_std_range = noise_std_range
+        self.downsample_prob = downsample_prob
+        self.downsample_range = downsample_range
+
+        self.min_image_size = min_image_size
+        self.max_image_size = max_image_size
+
+        self.to_tensor = T.ToTensor()
+
+    def _apply_fast_augmentations(self, patch_t: torch.Tensor) -> torch.Tensor:
+        """
+        Apply fast tensor-based augmentations (no PIL, no JPEG BytesIO).
+
+        Args:
+            patch_t: [3, P, P] tensor in [0, 1]
+
+        Returns:
+            augmented: [3, P, P] tensor in [0, 1]
+        """
+        x = patch_t
+
+        # Gaussian blur via conv2d
+        if random.random() < self.blur_prob:
+            sigma = random.uniform(*self.blur_sigma_range)
+            kernel_size = int(6 * sigma + 1) | 1
+            kernel_size = max(3, min(kernel_size, 11))
+
+            # Create Gaussian kernel
+            coords = torch.arange(kernel_size, dtype=torch.float32) - (kernel_size - 1) / 2
+            g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+            kernel = g.outer(g)
+            kernel = kernel / kernel.sum()
+            kernel = kernel.unsqueeze(0).unsqueeze(0).repeat(3, 1, 1, 1)
+
+            padding = kernel_size // 2
+            x = x.unsqueeze(0)  # [1, 3, P, P]
+            x = F.conv2d(x, kernel, padding=padding, groups=3)
+            x = x.squeeze(0)  # [3, P, P]
+
+        # Downsample + upsample (simulates compression artifacts)
+        if random.random() < self.downsample_prob:
+            ratio = random.uniform(*self.downsample_range)
+            _, H, W = x.shape
+            new_H, new_W = max(8, int(H * ratio)), max(8, int(W * ratio))
+            x = x.unsqueeze(0)
+            x = F.interpolate(x, size=(new_H, new_W), mode='bilinear', align_corners=False)
+            x = F.interpolate(x, size=(H, W), mode='bilinear', align_corners=False)
+            x = x.squeeze(0)
+
+        # Gaussian noise
+        if random.random() < self.noise_prob:
+            std = random.uniform(*self.noise_std_range)
+            noise = torch.randn_like(x) * std
+            x = torch.clamp(x + noise, 0, 1)
+
+        return x
+
+    def _compute_information_map(self, img: Image.Image, downsample_factor: int = 4) -> np.ndarray:
+        """Compute information/saliency map using Laplacian magnitude."""
+        img_gray = np.array(img.convert('L'))
+        h, w = img_gray.shape
+        new_h, new_w = h // downsample_factor, w // downsample_factor
+        img_small = cv2.resize(img_gray, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+        laplacian = cv2.Laplacian(img_small, cv2.CV_64F)
+        info_map = np.abs(laplacian)
+        info_map = cv2.GaussianBlur(info_map, (5, 5), 0)
+
+        if info_map.max() > 0:
+            info_map = info_map / info_map.max()
+        info_map = info_map * 0.9 + 0.1
+
+        return info_map
+
+    def _calculate_optimal_num_tubes(self, img_w: int, img_h: int) -> int:
+        """Calculate optimal number of tubes based on image size."""
+        largest_scale = self.scales[-1]
+        stride = int(largest_scale * (1.0 - self.overlap_ratio))
+        stride = max(stride, largest_scale // 2)
+
+        nx = max(1, (img_w - largest_scale) // stride + 1)
+        ny = max(1, (img_h - largest_scale) // stride + 1)
+        total_possible = nx * ny
+
+        return max(self.min_tubes, min(total_possible, self.max_tubes))
+
+    def _sample_tube_centers(self, img: Image.Image, num_tubes: int) -> List[Tuple[float, float]]:
+        """Sample tube centers with information-weighted priority."""
+        w, h = img.size
+        max_scale = self.scales[-1]
+
+        margin_y = max_scale / (2 * h)
+        margin_x = max_scale / (2 * w)
+
+        info_map = self._compute_information_map(img, downsample_factor=4)
+        info_h, info_w = info_map.shape
+        min_distance = 1.5 * max_scale / max(h, w)
+
+        centers = []
+        max_attempts = num_tubes * 20
+        attempts = 0
+
+        while len(centers) < num_tubes and attempts < max_attempts:
+            attempts += 1
+            flat_probs = info_map.flatten()
+            flat_probs = flat_probs / flat_probs.sum()
+
+            idx = np.random.choice(len(flat_probs), p=flat_probs)
+            iy, ix = np.unravel_index(idx, (info_h, info_w))
+
+            cy = (iy + 0.5) / info_h
+            cx = (ix + 0.5) / info_w
+
+            if cy < margin_y or cy > 1 - margin_y:
+                continue
+            if cx < margin_x or cx > 1 - margin_x:
+                continue
+
+            too_close = False
+            for existing_cy, existing_cx in centers:
+                dist = np.sqrt((cy - existing_cy)**2 + (cx - existing_cx)**2)
+                if dist < min_distance:
+                    too_close = True
+                    break
+
+            if not too_close:
+                centers.append((cy, cx))
+                iy_min = max(0, int(iy - info_h * min_distance / 2))
+                iy_max = min(info_h, int(iy + info_h * min_distance / 2))
+                ix_min = max(0, int(ix - info_w * min_distance / 2))
+                ix_max = min(info_w, int(ix + info_w * min_distance / 2))
+                info_map[iy_min:iy_max, ix_min:ix_max] *= 0.1
+
+        while len(centers) < num_tubes:
+            cy = random.uniform(margin_y, 1 - margin_y)
+            cx = random.uniform(margin_x, 1 - margin_x)
+            centers.append((cy, cx))
+
+        return centers
+
+    def _extract_tube_patches(self, img: Image.Image, center_y: float, center_x: float) -> List[torch.Tensor]:
+        """Extract patches at multiple scales, returns list of [3, P, P] tensors."""
+        w, h = img.size
+        cy_pix = int(center_y * h)
+        cx_pix = int(center_x * w)
+
+        scale_patches = []
+        for scale in self.scales:
+            half = scale // 2
+            x1 = max(0, cx_pix - half)
+            y1 = max(0, cy_pix - half)
+            x2 = min(w, x1 + scale)
+            y2 = min(h, y1 + scale)
+
+            if x2 - x1 < scale:
+                x1 = max(0, x2 - scale)
+            if y2 - y1 < scale:
+                y1 = max(0, y2 - scale)
+
+            crop = img.crop((x1, y1, x2, y2))
+            crop_resized = TF.resize(crop, (self.target_size, self.target_size))
+            crop_t = self.to_tensor(crop_resized)  # [3, P, P] in [0, 1]
+            scale_patches.append(crop_t)
+
+        return scale_patches
+
+    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Process batch into multi-scale tubes (RGB only, preprocessing on GPU).
+
+        Returns:
+            Dict with:
+                - tubes_rgb:     [B, max_tubes, K, V, 3, P, P] - RGB in [0,1]
+                - tube_centers:  [B, max_tubes, 2]
+                - tube_mask:     [B, max_tubes]
+                - labels:        [B]
+                - model_labels:  [B] (optional)
+        """
+        B = len(batch)
+        K = len(self.scales)
+        V = self.num_views
+        P = self.target_size
+
+        # Pre-allocate output tensors
+        tubes_rgb = torch.zeros(B, self.max_tubes, K, V, 3, P, P)
+        tube_centers = torch.zeros(B, self.max_tubes, 2)
+        tube_mask = torch.zeros(B, self.max_tubes, dtype=torch.bool)
+
+        labels = []
+        model_labels = []
+        image_paths = []
+        benchmarks = []
+
+        for b, item in enumerate(batch):
+            img = item["image"]
+            label = item["label"]
+
+            if "model_label" in item:
+                model_labels.append(item["model_label"])
+            if "abs_path" in item:
+                image_paths.append(item["abs_path"])
+            if "benchmark" in item:
+                benchmarks.append(item["benchmark"])
+
+            # Ensure PIL Image
+            if isinstance(img, torch.Tensor):
+                img = TF.to_pil_image(img)
+
+            # Resize if needed
+            w, h = img.size
+            if min(w, h) < self.min_image_size:
+                scale_factor = self.min_image_size / min(w, h)
+                img = TF.resize(img, (int(h * scale_factor), int(w * scale_factor)))
+                w, h = img.size
+            elif max(w, h) > self.max_image_size:
+                scale_factor = self.max_image_size / max(w, h)
+                img = TF.resize(img, (int(h * scale_factor), int(w * scale_factor)))
+                w, h = img.size
+
+            # Calculate tubes for this image
+            num_tubes_i = self._calculate_optimal_num_tubes(w, h)
+            centers = self._sample_tube_centers(img, num_tubes_i)
+
+            # Store centers and mask
+            for n in range(num_tubes_i):
+                tube_centers[b, n, 0] = centers[n][0]
+                tube_centers[b, n, 1] = centers[n][1]
+                tube_mask[b, n] = True
+
+            # Extract tubes
+            for n, (cy, cx) in enumerate(centers):
+                scale_patches = self._extract_tube_patches(img, cy, cx)
+
+                for k, patch_t in enumerate(scale_patches):
+                    # View 0: original (no augmentation)
+                    tubes_rgb[b, n, k, 0] = patch_t
+
+                    # Views 1..V-1: augmented
+                    for v in range(1, V):
+                        tubes_rgb[b, n, k, v] = self._apply_fast_augmentations(patch_t)
+
+            labels.append(label)
+
+        output = {
+            "tubes_rgb":     tubes_rgb,      # [B, max_tubes, K, V, 3, P, P]
+            "tube_centers":  tube_centers,   # [B, max_tubes, 2]
+            "tube_mask":     tube_mask,      # [B, max_tubes]
+            "labels":        torch.tensor(labels, dtype=torch.long),
+        }
+
+        if model_labels:
+            output["model_labels"] = torch.tensor(model_labels, dtype=torch.long)
+        if image_paths:
+            output["image_paths"] = image_paths
+        if benchmarks:
+            output["benchmarks"] = benchmarks
 
         return output

@@ -37,9 +37,11 @@ import torch.nn.functional as F
 import torchvision.models as tvm
 import pytorch_lightning as pl
 
+from .constants import IMAGENET_MEAN, IMAGENET_STD
 from .metrics import compute_binary_auc
 from .models import AttnAggregator
 from .losses import Phase1Loss
+from .gpu_preprocessing import GPUPreprocessor
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +185,7 @@ class TubeModel(nn.Module):
     """
     Core forensics model for multi-scale tube learning.
 
-    Takes the output of MultiScaleTubeCollator and produces:
+    Takes the output of MultiScaleTubeCollator or FastMultiScaleTubeCollator and produces:
       - z_auth:       [B, N, D_auth]   per-tube auth embeddings (contrastive)
       - z_src:        [B, N, D_src]    per-tube source embeddings (contrastive)
       - a_local:      [B, N]           per-tube local auth score (MIL / top-k)
@@ -191,6 +193,10 @@ class TubeModel(nn.Module):
       - attn_weights: [B, N]           MIL attention weights
       - logits_auth:  [B, 2]           binary classification logits
       - logits_src:   [B, M] or None   source classification logits
+
+    Optimizations:
+      - GPU preprocessing: residual/wavelet computed on GPU (not in collator)
+      - Batched view encoding: all views processed in single forward pass
 
     Args:
         encoder_dim:        output dim of each PatchEncoder branch
@@ -200,6 +206,7 @@ class TubeModel(nn.Module):
         attn_dim:           dim for MIL attention MLP
         num_src_classes:    number of generator classes (None → no source head)
         pretrained_spatial: use ImageNet weights for the spatial (6-ch) encoder
+        target_size:        patch size for GPU preprocessing
     """
 
     def __init__(
@@ -211,12 +218,21 @@ class TubeModel(nn.Module):
         attn_dim: int = 128,
         num_src_classes: Optional[int] = None,
         pretrained_spatial: bool = False,
+        target_size: int = 96,
     ):
         super().__init__()
         self.fused_dim = fused_dim
         self.z_auth_dim = z_auth_dim
         self.z_src_dim  = z_src_dim
         self.num_src_classes = num_src_classes
+        self.target_size = target_size
+
+        # ── GPU Preprocessing ────────────────────────────────────────────────
+        self.gpu_preproc = GPUPreprocessor(target_size=target_size)
+
+        # ── ImageNet normalization constants (for GPU) ────────────────────────
+        self.register_buffer('img_mean', torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1))
+        self.register_buffer('img_std', torch.tensor(IMAGENET_STD).view(1, 3, 1, 1))
 
         # ── Encoders ──────────────────────────────────────────────────────────
         # Spatial branch: 6 channels = RGB (ImageNet-norm) + high-freq residual
@@ -248,6 +264,28 @@ class TubeModel(nn.Module):
         )
 
     # -------------------------------------------------------------------------
+
+    def preprocess_rgb(self, rgb: torch.Tensor) -> tuple:
+        """
+        Preprocess RGB patches to spatial (6-ch) and wavelet (3-ch) inputs.
+
+        Args:
+            rgb: [B, 3, H, W] RGB patches in [0, 1] (NOT normalized)
+
+        Returns:
+            spatial: [B, 6, H, W] - RGB (ImageNet-norm) + residual
+            wavelet: [B, 3, H, H] - Haar DWT bands
+        """
+        # Compute residual and wavelet on GPU
+        residual, wavelet = self.gpu_preproc(rgb)
+
+        # ImageNet normalize RGB
+        rgb_norm = (rgb - self.img_mean) / self.img_std
+
+        # Concatenate for spatial branch
+        spatial = torch.cat([rgb_norm, residual], dim=1)  # [B, 6, H, W]
+
+        return spatial, wavelet
 
     def encode_patches(
         self,
@@ -289,6 +327,42 @@ class TubeModel(nn.Module):
             "z_src":  z_src.view(B, N, K, self.z_src_dim),
         }
 
+    def encode_patches_from_rgb(
+        self,
+        tubes_rgb: torch.Tensor,
+        view_idx: int = 0,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Encode patches from RGB input (GPU preprocessing included).
+
+        Args:
+            tubes_rgb: [B, N, K, V, 3, P, P] RGB in [0, 1]
+            view_idx:  which view to encode
+
+        Returns:
+            Same as encode_patches
+        """
+        B, N, K, V, _, P, _ = tubes_rgb.shape
+
+        rgb = tubes_rgb[:, :, :, view_idx]  # [B, N, K, 3, P, P]
+        rgb_flat = rgb.reshape(B * N * K, 3, P, P)
+
+        # GPU preprocessing
+        sp_flat, fr_flat = self.preprocess_rgb(rgb_flat)
+
+        h_sp = self.enc_spatial(sp_flat)
+        h_fr = self.enc_wavelet(fr_flat)
+
+        h      = self.fusion(h_sp, h_fr)
+        z_auth = self.proj_auth(h)
+        z_src  = self.proj_src(h)
+
+        return {
+            "h":      h.view(B, N, K, self.fused_dim),
+            "z_auth": z_auth.view(B, N, K, self.z_auth_dim),
+            "z_src":  z_src.view(B, N, K, self.z_src_dim),
+        }
+
     def encode_all_views(
         self,
         tubes: torch.Tensor,
@@ -323,6 +397,8 @@ class TubeModel(nn.Module):
         Encode all V views and K scales without any aggregation.
         Used by Phase 1 contrastive losses that need the full [B, N, K, V, D] tensors.
 
+        OPTIMIZED: Batches all views into a single forward pass instead of V sequential passes.
+
         Args:
             tubes:         [B, N, K, V, 6, P, P]
             tubes_wavelet: [B, N, K, V, 3, P, P]
@@ -331,17 +407,59 @@ class TubeModel(nn.Module):
             z_auth: [B, N, K, V, D_auth]  per-scale per-view auth embeddings (L2-norm)
             z_src:  [B, N, K, V, D_src]   per-scale per-view src  embeddings (L2-norm)
         """
-        V = tubes.shape[3]
-        z_auth_views, z_src_views = [], []
+        B, N, K, V, _, P, _ = tubes.shape
 
-        for v in range(V):
-            enc = self.encode_patches(tubes, tubes_wavelet, view_idx=v)
-            z_auth_views.append(enc["z_auth"])  # [B, N, K, D_auth]
-            z_src_views.append(enc["z_src"])    # [B, N, K, D_src]
+        # Reshape to batch all views together: [B*N*K*V, C, P, P]
+        sp_flat = tubes.reshape(B * N * K * V, 6, P, P)
+        fr_flat = tubes_wavelet.reshape(B * N * K * V, 3, P, P)
 
-        # Stack along V → [B, N, K, V, D]
-        z_auth = torch.stack(z_auth_views, dim=3)  # [B, N, K, V, D_auth]
-        z_src  = torch.stack(z_src_views,  dim=3)  # [B, N, K, V, D_src]
+        # Single forward pass for all views
+        h_sp = self.enc_spatial(sp_flat)  # [B*N*K*V, D_enc]
+        h_fr = self.enc_wavelet(fr_flat)  # [B*N*K*V, D_enc]
+
+        h      = self.fusion(h_sp, h_fr)   # [B*N*K*V, D_fused]
+        z_auth = self.proj_auth(h)          # [B*N*K*V, D_auth]
+        z_src  = self.proj_src(h)           # [B*N*K*V, D_src]
+
+        # Reshape back to [B, N, K, V, D]
+        z_auth = z_auth.view(B, N, K, V, self.z_auth_dim)
+        z_src  = z_src.view(B, N, K, V, self.z_src_dim)
+
+        return {"z_auth": z_auth, "z_src": z_src}
+
+    def encode_per_scale_all_views_from_rgb(
+        self,
+        tubes_rgb: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Encode all views from RGB input (GPU preprocessing + batched forward).
+
+        Args:
+            tubes_rgb: [B, N, K, V, 3, P, P] RGB in [0, 1]
+
+        Returns:
+            z_auth: [B, N, K, V, D_auth]
+            z_src:  [B, N, K, V, D_src]
+        """
+        B, N, K, V, _, P, _ = tubes_rgb.shape
+
+        # Flatten all patches
+        rgb_flat = tubes_rgb.reshape(B * N * K * V, 3, P, P)
+
+        # GPU preprocessing
+        sp_flat, fr_flat = self.preprocess_rgb(rgb_flat)
+
+        # Single forward pass
+        h_sp = self.enc_spatial(sp_flat)
+        h_fr = self.enc_wavelet(fr_flat)
+
+        h      = self.fusion(h_sp, h_fr)
+        z_auth = self.proj_auth(h)
+        z_src  = self.proj_src(h)
+
+        # Reshape back
+        z_auth = z_auth.view(B, N, K, V, self.z_auth_dim)
+        z_src  = z_src.view(B, N, K, V, self.z_src_dim)
 
         return {"z_auth": z_auth, "z_src": z_src}
 
@@ -349,6 +467,7 @@ class TubeModel(nn.Module):
         self,
         tubes: torch.Tensor,
         tubes_wavelet: torch.Tensor,
+        tube_mask: torch.Tensor = None,  # [B, N] bool mask
         view_idx: int = 0,
     ) -> Dict[str, torch.Tensor]:
         """
@@ -357,6 +476,7 @@ class TubeModel(nn.Module):
         Args:
             tubes:         [B, N, K, V, 6, P, P]
             tubes_wavelet: [B, N, K, V, 3, P, P]
+            tube_mask:     [B, N] bool (True = valid tube, False = padding)
             view_idx:      view to encode (0 = no augmentation)
 
         Returns:
@@ -382,7 +502,9 @@ class TubeModel(nn.Module):
         a_local = self.local_score(z_auth_tube).squeeze(-1)  # [B, N]
 
         # MIL attention pooling over N tubes → image representation
-        tube_mask = torch.ones(B, N, dtype=torch.bool, device=tubes.device)
+        # Use tube_mask if provided, otherwise all tubes are valid
+        if tube_mask is None:
+            tube_mask = torch.ones(B, N, dtype=torch.bool, device=tubes.device)
         h_img, attn_weights = self.mil_agg(h_tube, tube_mask)  # [B, D_fused], [B, N]
 
         # Classification heads
@@ -399,6 +521,50 @@ class TubeModel(nn.Module):
             "logits_src":   logits_src,    # [B, M] or None
         }
 
+    def forward_from_rgb(
+        self,
+        tubes_rgb: torch.Tensor,
+        tube_mask: torch.Tensor = None,
+        view_idx: int = 0,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Classification forward from RGB input (FastMultiScaleTubeCollator format).
+
+        Args:
+            tubes_rgb: [B, N, K, V, 3, P, P] RGB in [0, 1]
+            tube_mask: [B, N] bool mask
+            view_idx:  view to encode
+
+        Returns:
+            Same as forward()
+        """
+        B, N = tubes_rgb.shape[:2]
+
+        enc = self.encode_patches_from_rgb(tubes_rgb, view_idx)
+
+        h_tube      = enc["h"].mean(dim=2)
+        z_auth_tube = F.normalize(enc["z_auth"].mean(dim=2), dim=-1)
+        z_src_tube  = F.normalize(enc["z_src"].mean(dim=2),  dim=-1)
+
+        a_local = self.local_score(z_auth_tube).squeeze(-1)
+
+        if tube_mask is None:
+            tube_mask = torch.ones(B, N, dtype=torch.bool, device=tubes_rgb.device)
+        h_img, attn_weights = self.mil_agg(h_tube, tube_mask)
+
+        logits_auth = self.binary_head(h_img)
+        logits_src  = self.source_head(h_img) if self.source_head is not None else None
+
+        return {
+            "z_auth":       z_auth_tube,
+            "z_src":        z_src_tube,
+            "a_local":      a_local,
+            "h_img":        h_img,
+            "attn_weights": attn_weights,
+            "logits_auth":  logits_auth,
+            "logits_src":   logits_src,
+        }
+
 
 # ---------------------------------------------------------------------------
 # Lightning module
@@ -412,6 +578,10 @@ class TubeContrastiveModule(pl.LightningModule):
       - phase=1 : pure contrastive training (Phase1Loss — SupCon auth + SupCon src + decoupling)
       - phase=2 : classification fine-tuning (BCE auth + optional CE src)
 
+    Supports two input formats:
+      - Legacy: tubes [B,N,K,V,6,P,P] + tubes_wavelet [B,N,K,V,3,P,P] (CPU preprocessing)
+      - Fast:   tubes_rgb [B,N,K,V,3,P,P] (GPU preprocessing via FastMultiScaleTubeCollator)
+
     Args:
         encoder_dim:        output dim of each PatchEncoder branch
         fused_dim:          dim after FusionMLP
@@ -424,6 +594,7 @@ class TubeContrastiveModule(pl.LightningModule):
         warmup_steps:       linear warm-up steps
         predict_model:      whether to predict the source/model label
         phase:              training phase (1=contrastive, 2=classification)
+        target_size:        patch size (for GPU preprocessing)
         lambda_auth:        [phase 1] weight for auth SupCon loss
         lambda_src_con:     [phase 1] weight for src  SupCon loss
         lambda_decouple:    [phase 1] weight for decoupling penalty
@@ -446,10 +617,12 @@ class TubeContrastiveModule(pl.LightningModule):
         predict_model: bool = False,
         # Phase selection
         phase: int = 1,
+        # Target size for GPU preprocessing
+        target_size: int = 96,
         # Phase 1 loss hyperparameters
         lambda_auth: float = 1.0,
         lambda_src_con: float = 0.5,
-        lambda_decouple: float = 0.1,
+        lambda_decouple: float = 0.01,
         temp_auth: float = 0.07,
         temp_src: float = 0.07,
         # Phase 2 loss hyperparameters
@@ -471,6 +644,7 @@ class TubeContrastiveModule(pl.LightningModule):
             attn_dim=attn_dim,
             num_src_classes=num_src_classes,
             pretrained_spatial=pretrained_spatial,
+            target_size=target_size,
         )
 
         # Phase 1: contrastive losses
@@ -490,23 +664,90 @@ class TubeContrastiveModule(pl.LightningModule):
 
     # -------------------------------------------------------------------------
 
-    def forward(self, tubes, tubes_wavelet, view_idx: int = 0):
-        return self.model(tubes, tubes_wavelet, view_idx=view_idx)
+    def freeze_layers(
+        self,
+        freeze_encoders: bool = True,
+        freeze_fusion: bool = False,
+        freeze_projections: bool = True,
+    ):
+        """
+        Freeze specific layers for phase 2 fine-tuning.
+
+        Args:
+            freeze_encoders:    freeze enc_spatial and enc_wavelet (recommended)
+            freeze_fusion:      freeze FusionMLP (False → train it in phase 2)
+            freeze_projections: freeze proj_auth and proj_src (True → not used in phase 2)
+
+        Always trainable in phase 2:
+            - mil_agg (AttnAggregator)
+            - binary_head
+            - source_head (if predict_model=True)
+        """
+        if freeze_encoders:
+            for param in self.model.enc_spatial.parameters():
+                param.requires_grad = False
+            for param in self.model.enc_wavelet.parameters():
+                param.requires_grad = False
+
+        if freeze_fusion:
+            for param in self.model.fusion.parameters():
+                param.requires_grad = False
+
+        if freeze_projections:
+            for param in self.model.proj_auth.parameters():
+                param.requires_grad = False
+            for param in self.model.proj_src.parameters():
+                param.requires_grad = False
+            for param in self.model.local_score.parameters():
+                param.requires_grad = False
+
+        # Also freeze GPU preprocessor (no trainable params, but good practice)
+        for param in self.model.gpu_preproc.parameters():
+            param.requires_grad = False
+
+        # Log trainable params
+        total = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(f"[freeze_layers] Trainable: {trainable:,} / {total:,} ({100*trainable/total:.1f}%)")
+
+    def forward(self, tubes, tubes_wavelet=None, tube_mask=None, view_idx: int = 0):
+        """Forward with auto-detection of input format."""
+        if tubes_wavelet is not None:
+            # Legacy format: tubes [B,N,K,V,6,P,P] + tubes_wavelet [B,N,K,V,3,P,P]
+            return self.model(tubes, tubes_wavelet, tube_mask=tube_mask, view_idx=view_idx)
+        else:
+            # Fast format: tubes is actually tubes_rgb [B,N,K,V,3,P,P]
+            return self.model.forward_from_rgb(tubes, tube_mask=tube_mask, view_idx=view_idx)
+
+    def _get_input_tensors(self, batch: Dict[str, Any]):
+        """Extract input tensors from batch, handling both formats."""
+        if "tubes_rgb" in batch:
+            # Fast format (FastMultiScaleTubeCollator)
+            return batch["tubes_rgb"], None, True
+        else:
+            # Legacy format (MultiScaleTubeCollator)
+            return batch["tubes"], batch["tubes_wavelet"], False
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int):
-        tubes  = batch["tubes"]
-        wav    = batch["tubes_wavelet"]
+        tubes, wav, is_rgb_format = self._get_input_tensors(batch)
         labels = batch["labels"]
+        tube_mask = batch.get("tube_mask", None)
         model_labels = batch.get("model_labels", None)
 
         if self.phase == 1:
             # ── Pure contrastive phase ─────────────────────────────────────────
             B, N, K, V = tubes.shape[:4]
-            enc    = self.model.encode_per_scale_all_views(tubes, wav)
+
+            if is_rgb_format:
+                enc = self.model.encode_per_scale_all_views_from_rgb(tubes)
+            else:
+                enc = self.model.encode_per_scale_all_views(tubes, wav)
+
             losses = self.phase1_loss(
                 enc["z_auth"], enc["z_src"],
                 labels, model_labels,
                 B, N, K, V,
+                tube_mask=tube_mask,
             )
             loss = losses["loss"]
             self.log("train/loss",          loss,                    prog_bar=True,  on_step=True, on_epoch=True)
@@ -516,7 +757,7 @@ class TubeContrastiveModule(pl.LightningModule):
 
         else:
             # ── Classification phase ───────────────────────────────────────────
-            out  = self(tubes, wav, view_idx=0)
+            out = self(tubes, wav, tube_mask=tube_mask, view_idx=0)
             loss = self.loss_auth(out["logits_auth"], labels)
             self.log("train/loss",      loss, prog_bar=True,  on_step=True, on_epoch=True)
             self.log("train/loss_auth", loss, prog_bar=False, on_step=True, on_epoch=True)
@@ -538,19 +779,25 @@ class TubeContrastiveModule(pl.LightningModule):
         return loss
 
     def validation_step(self, batch: Dict[str, Any], batch_idx: int):
-        tubes  = batch["tubes"]
-        wav    = batch["tubes_wavelet"]
+        tubes, wav, is_rgb_format = self._get_input_tensors(batch)
         labels = batch["labels"]
+        tube_mask = batch.get("tube_mask", None)
         model_labels = batch.get("model_labels", None)
 
         if self.phase == 1:
             # ── Contrastive val loss ───────────────────────────────────────────
             B, N, K, V = tubes.shape[:4]
-            enc    = self.model.encode_per_scale_all_views(tubes, wav)
+
+            if is_rgb_format:
+                enc = self.model.encode_per_scale_all_views_from_rgb(tubes)
+            else:
+                enc = self.model.encode_per_scale_all_views(tubes, wav)
+
             losses = self.phase1_loss(
                 enc["z_auth"], enc["z_src"],
                 labels, model_labels,
                 B, N, K, V,
+                tube_mask=tube_mask,
             )
             loss = losses["loss"]
             self.log("val/loss",          loss,                    prog_bar=True,  on_epoch=True, on_step=False)
@@ -561,7 +808,7 @@ class TubeContrastiveModule(pl.LightningModule):
 
         else:
             # ── Classification val ─────────────────────────────────────────────
-            out  = self(tubes, wav, view_idx=0)
+            out = self(tubes, wav, tube_mask=tube_mask, view_idx=0)
             loss = self.loss_auth(out["logits_auth"], labels)
 
             preds = out["logits_auth"].argmax(dim=-1)

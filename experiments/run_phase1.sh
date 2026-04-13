@@ -2,16 +2,18 @@
 set -eo pipefail
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
-TRAIN_PATH="data/train.csv"
-VAL_PATH="data/val.csv"
+TRAIN_PATH="data/dataset_v5/train.csv"
+VAL_PATH="data/dataset_v5/val.csv"
 ROOT_DIR=""          # prepended to relative image paths (leave empty if absolute)
-OUTPUT_DIR="out/phase1"
-DEVICE=5
+OUTPUT_DIR="runs/phase1"
+DEVICE=4
 
-# ─── Tube configuration ───────────────────────────────────────────────────────
-NUM_TUBES=8
-SCALES="64 128 256"
-TARGET_SIZE=128
+# ─── Adaptive tube configuration ─────────────────────────────────────────────
+MAX_TUBES=8         # Maximum tubes per image (adaptive)
+MIN_TUBES=2          # Minimum tubes per image
+OVERLAP_RATIO=0   # Target overlap ratio (0=no overlap, 0.5=half overlap)
+SCALES="64 96 128"
+TARGET_SIZE=96
 NUM_VIEWS=2
 MIN_IMAGE_SIZE=256
 MAX_IMAGE_SIZE=2048
@@ -26,7 +28,7 @@ ATTN_DIM=128
 # ─── Phase 1 loss weights ─────────────────────────────────────────────────────
 LAMBDA_AUTH=1.0
 LAMBDA_SRC_CON=0.5
-LAMBDA_DECOUPLE=0.1
+LAMBDA_DECOUPLE=0.01
 TEMP_AUTH=0.07
 TEMP_SRC=0.07
 
@@ -34,7 +36,7 @@ TEMP_SRC=0.07
 LR=5e-4
 WARMUP_STEPS=200
 MAX_EPOCHS=50
-BATCH_SIZE=48
+BATCH_SIZE=64
 ACCUM=1          # effective batch = BATCH_SIZE × ACCUM
 NUM_WORKERS=8
 
@@ -51,7 +53,9 @@ python scripts/train_phase1.py \
     --root_dir          "$ROOT_DIR" \
     --output_dir        "$OUTPUT_DIR" \
     --device            "$DEVICE" \
-    --num_tubes         "$NUM_TUBES" \
+    --max_tubes         "$MAX_TUBES" \
+    --min_tubes         "$MIN_TUBES" \
+    --overlap_ratio     "$OVERLAP_RATIO" \
     --scales            $SCALES \
     --target_size       "$TARGET_SIZE" \
     --num_views         "$NUM_VIEWS" \

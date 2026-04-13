@@ -1,0 +1,156 @@
+# ============================================================================
+# Self-supervised contrastive learning — ResNet50nodown + Multicrop Concéntrico
+# ============================================================================
+# Usage (with overrides):
+#   sbatch jobs/train_1node.sh selfcon/resnet50_multicrop [dtcwt] [robust] [b1c] [...]
+#
+# This is the MULTICROP BASE config. Equivalent to benchmark Multicrop (#1).
+# 3 crops concéntricos (96, 128, 256 → 128px) como vistas positivas.
+# Sin GradCache: 3 crops × bs50 = 150 entradas/GPU.
+#
+# Overrides disponibles:
+#   dtcwt   — Activa DT-CWT wavelet front-end (21ch entrada)
+#   robust  — CNNSpot-style per-crop degradation (JPEG+blur independientes)
+#   b1c     — Invariance loss + degradation views (requiere cambios de código)
+# ============================================================================
+
+seed_everything: 1
+
+ckpt_path: null
+
+trainer:
+    accelerator: gpu
+    strategy: ddp
+    devices: 4
+    max_epochs: 400
+    precision: 32
+    log_every_n_steps: 10
+
+    # Callbacks — paths use __EXP__ placeholder, replaced by job script
+    callbacks:
+        - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+          init_args:
+              dirpath: ./experiments/__EXP__/checkpoints
+              filename: "epoch_{epoch:03d}"
+              save_top_k: -1
+              every_n_epochs: 10
+              save_last: false
+              save_on_train_epoch_end: true
+
+        - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+          init_args:
+              dirpath: ./experiments/__EXP__/resume
+              save_top_k: 1
+              every_n_epochs: 1
+              save_last: true
+              save_on_train_epoch_end: true
+
+        - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+          init_args:
+              logging_interval: step
+
+        - class_path: lightning.pytorch.callbacks.TQDMProgressBar
+          init_args:
+              refresh_rate: 10
+
+        - class_path: src.callbacks.tsne_visualization.TSNEVisualizationCallback
+          init_args:
+              every_n_epochs: 10
+              plot_every_n_epochs: 50
+              save_dir: ./experiments/__EXP__/visualizations
+              use_wandb: true
+              perturbations:
+                  - name: webp_80
+                    type: webp
+                    quality: 80
+
+    # Logger
+    logger:
+        class_path: lightning.pytorch.loggers.WandbLogger
+        init_args:
+            project: imaginet
+            name: __EXP__
+            save_dir: ./experiments/__EXP__
+            id: null
+            resume: allow
+            tags: [selfcon, resnet50, ddp, multicrop]
+
+# Model configuration
+model:
+    arch: resnet50nodown
+    selfcon_pos: [false, true, false]
+    selfcon_arch: resnet
+    selfcon_size: fc
+    feat_dim: 128
+    pretrained_weights: imagenet
+
+    use_bayar_conv: false
+    bayar_kernel_size: 5
+
+    # Optimizer — SGD baseline
+    learning_rate: 0.005
+    weight_decay: 0.0001
+    momentum: 0.9
+    optimizer_name: sgd
+
+    # Loss
+    temp: 0.07
+
+    # Scheduler
+    epochs: 400
+    warmup_epochs: 10
+    cosine: true
+
+    # No GradCache — exact gradients, local batch contrastive loss
+    grad_cache: false
+
+    # Multicrop: 3 crops concéntricos
+    num_crops: 3
+
+# Data configuration
+data:
+    data_dir: /home/jhuertas/work/jsalazar/datasets/imaginet
+    annotations_file: ./data/annotations/train_wsora_wflux_wfirefly_annotations.txt
+    batch_size: 50
+    num_workers: 8
+    track: all
+    crop_size: 128
+    viz_samples_per_class: 200
+    viz_batch_size: 64
+    extra_viz_datasets:
+        - name: chameleon
+          annotation_file: ./data/annotations/chameleon.txt
+          samples_per_class: 1000
+
+    # Multicrop sizes
+    multi_crop_sizes: [96, 128, 256]
+    multi_crop_target_size: 128
+
+    # Pre-crop: resize solamente (ConcentricMultiCrop hace el crop)
+    train_transforms:
+        class_path: src.data.transforms.augmentations.get_train_transforms
+        init_args:
+            transforms:
+                - type: random_resize
+                  scale_min: 0.5
+                  scale_max: 1.5
+                  blur: false
+                  p: 0.5
+
+    # Per-crop: compresión estándar + geométrico independiente por crop
+    per_crop_transforms:
+        class_path: src.data.transforms.augmentations.get_train_transforms
+        init_args:
+            transforms:
+                - type: compression
+                  quality_min: 50
+                  quality_max: 95
+                - type: geometric
+                  rotate_p: 0.33
+                  flip_p: 0.33
+
+    # Validation transforms
+    val_transforms:
+        class_path: src.data.transforms.augmentations.get_val_transforms
+        init_args:
+            crop_size: 128

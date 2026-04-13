@@ -142,15 +142,17 @@ class MultiScaleTubeDataset(torch.utils.data.Dataset):
     """
     
     def __init__(
-        self, 
-        data_path: str, 
+        self,
+        data_path: str,
         predict_model: bool = False,
+        return_benchmark: bool = False,
         root_dir: str = ""
     ):
         """
         Args:
-            data_path: Path to CSV file with columns: image_path, label, [model]
+            data_path: Path to CSV file with columns: image_path, label, [model], [benchmark]
             predict_model: If True, expects 'model' column for generator classification
+            return_benchmark: If True, returns benchmark column if present
             root_dir: Root directory to prepend to relative paths
         """
         data = pd.read_csv(data_path)
@@ -160,7 +162,8 @@ class MultiScaleTubeDataset(torch.utils.data.Dataset):
 
         self.image_paths = data["image_path"].tolist()
         self.root_dir = root_dir
-        
+        self.return_benchmark = return_benchmark
+
         # Main binary label: synthetic vs real (0 or 1)
         self.has_labels = "label" in data.columns
         if self.has_labels:
@@ -179,6 +182,12 @@ class MultiScaleTubeDataset(torch.utils.data.Dataset):
             self.model_label_names = sorted(data["model"].dropna().unique().tolist())
             _label_to_idx = {name: i for i, name in enumerate(self.model_label_names)}
             self.model_labels = [_label_to_idx.get(str(m), 0) for m in self.model_label_raw]
+
+        # Optional benchmark column
+        if "benchmark" in data.columns:
+            self.benchmarks = data["benchmark"].tolist()
+        else:
+            self.benchmarks = None
 
     def __len__(self) -> int:
         return len(self.image_paths)
@@ -230,14 +239,17 @@ class MultiScaleTubeDataset(torch.utils.data.Dataset):
 
         sample = {
             "image": img,  # Full PIL Image - collator will extract tubes
-            "label": label, 
+            "label": label,
             "path": raw_path,
             "abs_path": path,
             "is_fallback": is_fallback,
             "load_error": load_error,
         }
-        
+
         if self.predict_model and hasattr(self, 'model_labels'):
             sample["model_label"] = self.model_labels[idx]
+
+        if self.return_benchmark and self.benchmarks is not None:
+            sample["benchmark"] = self.benchmarks[idx]
 
         return sample

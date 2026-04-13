@@ -40,7 +40,7 @@ os.environ["HF_HOME"]           = "/opt/huggingface/cache"
 
 from src.constants import PROJECT
 from src.datasets import MultiScaleTubeDataset
-from src.collators import MultiScaleTubeCollator
+from src.collators import MultiScaleTubeCollator, FastMultiScaleTubeCollator
 from src.tube_model import TubeContrastiveModule
 
 # -------------------------------------------------------------------------
@@ -51,7 +51,11 @@ class TubeDataModule(pl.LightningDataModule):
     """
     Lightning DataModule for multi-scale tube contrastive training.
 
-    Train loader uses MultiScaleTubeCollator (with all augmented views).
+    Supports two collator modes:
+      - Legacy (MultiScaleTubeCollator): CPU preprocessing (residual + wavelet in collator)
+      - Fast   (FastMultiScaleTubeCollator): GPU preprocessing (residual + wavelet in model)
+
+    Train loader uses the selected collator (with all augmented views).
     Val   loader uses the same collator (augmented views are still needed
     to compute the Phase 1 contrastive val loss).
     """
@@ -64,14 +68,18 @@ class TubeDataModule(pl.LightningDataModule):
         batch_size:    int  = 8,
         num_workers:   int  = 8,
         predict_model: bool = False,
-        # Tube shape
-        num_tubes:    int       = 8,
+        # Adaptive tube configuration
+        max_tubes:    int       = 16,
+        min_tubes:    int       = 4,
+        overlap_ratio: float    = 0.25,
         scales:       list      = None,
         target_size:  int       = 128,
         num_views:    int       = 2,
         # Image size limits
         min_image_size: int = 256,
         max_image_size: int = 2048,
+        # Collator mode
+        use_fast_collator: bool = True,
     ):
         super().__init__()
         self.train_path     = train_path
@@ -81,22 +89,43 @@ class TubeDataModule(pl.LightningDataModule):
         self.num_workers    = num_workers
         self.predict_model  = predict_model
 
-        self.num_tubes       = num_tubes
+        self.max_tubes       = max_tubes
+        self.min_tubes       = min_tubes
+        self.overlap_ratio   = overlap_ratio
         self.scales          = scales or [64, 128, 256]
         self.target_size     = target_size
         self.num_views       = num_views
         self.min_image_size  = min_image_size
         self.max_image_size  = max_image_size
+        self.use_fast_collator = use_fast_collator
 
-        self.collator = MultiScaleTubeCollator(
-            num_tubes=self.num_tubes,
-            scales=self.scales,
-            target_size=self.target_size,
-            num_views=self.num_views,
-            normalize=True,
-            min_image_size=self.min_image_size,
-            max_image_size=self.max_image_size,
-        )
+        if use_fast_collator:
+            # GPU preprocessing (residual/wavelet in model forward)
+            self.collator = FastMultiScaleTubeCollator(
+                max_tubes=self.max_tubes,
+                min_tubes=self.min_tubes,
+                overlap_ratio=self.overlap_ratio,
+                scales=self.scales,
+                target_size=self.target_size,
+                num_views=self.num_views,
+                min_image_size=self.min_image_size,
+                max_image_size=self.max_image_size,
+            )
+            print("[INFO] Using FastMultiScaleTubeCollator (GPU preprocessing)")
+        else:
+            # CPU preprocessing (legacy, slower)
+            self.collator = MultiScaleTubeCollator(
+                max_tubes=self.max_tubes,
+                min_tubes=self.min_tubes,
+                overlap_ratio=self.overlap_ratio,
+                scales=self.scales,
+                target_size=self.target_size,
+                num_views=self.num_views,
+                normalize=True,
+                min_image_size=self.min_image_size,
+                max_image_size=self.max_image_size,
+            )
+            print("[INFO] Using MultiScaleTubeCollator (CPU preprocessing)")
 
     def setup(self, stage=None):
         self.train_dataset = MultiScaleTubeDataset(
@@ -119,6 +148,7 @@ class TubeDataModule(pl.LightningDataModule):
             collate_fn=self.collator,
             pin_memory=True,
             persistent_workers=self.num_workers > 0,
+            prefetch_factor=4 if self.num_workers > 0 else None,
         )
 
     def val_dataloader(self):
@@ -130,6 +160,7 @@ class TubeDataModule(pl.LightningDataModule):
             collate_fn=self.collator,
             pin_memory=True,
             persistent_workers=self.num_workers > 0,
+            prefetch_factor=4 if self.num_workers > 0 else None,
         )
 
 # -------------------------------------------------------------------------
@@ -148,13 +179,17 @@ def parse_args():
     parser.add_argument("--root_dir",    type=str, default="",     help="Root dir prepended to relative image paths")
     parser.add_argument("--device",      type=int, required=True,  help="GPU device ID")
 
-    # Tube configuration
-    parser.add_argument("--num_tubes",      type=int,          default=8,           help="Number of tube centers per image")
+    # Adaptive tube configuration
+    parser.add_argument("--max_tubes",      type=int,   default=16,   help="Maximum tubes per image (adaptive)")
+    parser.add_argument("--min_tubes",      type=int,   default=4,    help="Minimum tubes per image")
+    parser.add_argument("--overlap_ratio",  type=float, default=0.25, help="Target overlap ratio (0=no overlap, 0.5=half)")
     parser.add_argument("--scales",         type=int, nargs="+", default=[64, 128, 256], help="Crop sizes at each scale")
     parser.add_argument("--target_size",    type=int,          default=128,         help="Resize all crops to this size (px)")
     parser.add_argument("--num_views",      type=int,          default=2,           help="Views per tube (1 original + N-1 augmented)")
     parser.add_argument("--min_image_size", type=int,          default=256,         help="Skip images smaller than this")
     parser.add_argument("--max_image_size", type=int,          default=2048,        help="Resize images larger than this")
+    parser.add_argument("--use_fast_collator", action="store_true", default=True, help="Use FastMultiScaleTubeCollator (GPU preprocessing)")
+    parser.add_argument("--no_fast_collator",  action="store_true", help="Use legacy MultiScaleTubeCollator (CPU preprocessing)")
 
     # Model architecture
     parser.add_argument("--encoder_dim",        type=int,  default=256,  help="PatchEncoder output dim")
@@ -168,7 +203,7 @@ def parse_args():
     # Phase 1 loss weights
     parser.add_argument("--lambda_auth",     type=float, default=1.0,  help="Auth SupCon loss weight")
     parser.add_argument("--lambda_src_con",  type=float, default=0.5,  help="Src  SupCon loss weight")
-    parser.add_argument("--lambda_decouple", type=float, default=0.1,  help="Decoupling penalty weight")
+    parser.add_argument("--lambda_decouple", type=float, default=0.01, help="Decoupling penalty weight")
     parser.add_argument("--temp_auth",       type=float, default=0.07, help="Temperature τ for auth SupCon")
     parser.add_argument("--temp_src",        type=float, default=0.07, help="Temperature τ for src  SupCon")
 
@@ -219,11 +254,15 @@ def main():
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # Save hyper-parameters
-    with open(os.path.join(output_dir, "args.yaml"), "w") as f:
-        yaml.dump(vars(args), f, default_flow_style=False)
-
     # ── Data ──────────────────────────────────────────────────────────────
+    use_fast_collator = args.use_fast_collator and not args.no_fast_collator
+
+    # Save hyper-parameters (include use_fast_collator for phase 2 to detect)
+    saved_args = vars(args).copy()
+    saved_args["use_fast_collator"] = use_fast_collator
+    with open(os.path.join(output_dir, "args.yaml"), "w") as f:
+        yaml.dump(saved_args, f, default_flow_style=False)
+
     datamodule = TubeDataModule(
         train_path=args.train_path,
         val_path=args.val_path,
@@ -231,12 +270,15 @@ def main():
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         predict_model=args.predict_model,
-        num_tubes=args.num_tubes,
+        max_tubes=args.max_tubes,
+        min_tubes=args.min_tubes,
+        overlap_ratio=args.overlap_ratio,
         scales=args.scales,
         target_size=args.target_size,
         num_views=args.num_views,
         min_image_size=args.min_image_size,
         max_image_size=args.max_image_size,
+        use_fast_collator=use_fast_collator,
     )
     datamodule.setup(stage="fit")
 
@@ -259,12 +301,20 @@ def main():
         warmup_steps=args.warmup_steps,
         predict_model=args.predict_model,
         phase=1,
+        target_size=args.target_size,
         lambda_auth=args.lambda_auth,
         lambda_src_con=args.lambda_src_con,
         lambda_decouple=args.lambda_decouple,
         temp_auth=args.temp_auth,
         temp_src=args.temp_src,
     )
+
+    # Compile model for faster forward/backward (PyTorch 2.0+)
+    try:
+        model.model = torch.compile(model.model, mode="reduce-overhead")
+        print("[INFO] Model compiled with torch.compile (reduce-overhead mode)")
+    except Exception as e:
+        print(f"[WARN] torch.compile failed: {e}. Skipping compilation.")
 
     # ── Logger ────────────────────────────────────────────────────────────
     logger = WandbLogger(
@@ -290,7 +340,7 @@ def main():
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
         accelerator="gpu",
-        precision="bf16-mixed",
+        precision="bf16",
         devices=[args.device],
         accumulate_grad_batches=args.accumulate_grad_batches,
         logger=logger,
